@@ -1364,7 +1364,7 @@ with tab2:
                                 "Outlet / Brand Unit": selected_archive_unit,
                                 "Wage Month": selected_archive_month,
                                 "OneDrive File Link": f"{STATIC_WEB_PREFIX}/{selected_archive_state}/{selected_archive_unit}/{selected_archive_month}/{archive_file.name}",
-git rm --cached .streamlit/secrets.toml                            }
+                            }
                             for archive_file in archived_files
                         ]
                     )
