@@ -119,8 +119,8 @@ def get_active_master_data():
             st.error(f"❌ Failed to fetch Master Data from OneDrive: {e}")
             st.stop()
     try:
-        # Explicit engine to avoid ambiguous-format errors
-        return pd.read_excel(MASTER_FILE_PATH, engine="openpyxl")
+        # Read specifically the Conso_Data sheet for main dashboard analytics
+        return pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", engine="openpyxl")
     except Exception as e:
         st.error(f"❌ Failed to read local Master file: {e}")
         st.stop()
@@ -262,7 +262,7 @@ def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
 
         return df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register
     except Exception as exc:
-        st.error(f"Failed to download master data from Google Drive: {exc}")
+        st.error(f"Failed to download master data from OneDrive: {exc}")
         st.stop()
 
 
@@ -1047,29 +1047,49 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         if missing_cols:
             st.sidebar.error(f"❌ Missing columns: {missing_cols}")
         else:
+            # Read uploaded bytes and parse only the first sheet (new Conso_Data)
             buf = uploaded_file.getbuffer()
-            file_bytes = buf.tobytes()
+            uploaded_bytes = buf.tobytes()
+            try:
+                new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
+            except Exception as e:
+                st.sidebar.error(f"❌ Unable to parse uploaded Excel (first sheet): {e}")
+                st.stop()
 
-            # 1. Overwrite the Streamlit Local File
-            os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
-            with open(MASTER_FILE_PATH, "wb") as f:
-                f.write(file_bytes)
-
-            # 2. Email 1: Triggers "Update file" in Power Automate (Live Master)
-            email_success_1, msg_1 = email_file_to_outlook(file_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
-
-            # 3. Email 2: Triggers "Create file" in Power Automate for standardized historical backup
-            backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
-            email_success_2, msg_2 = email_file_to_outlook(file_bytes, backup_filename)
-
-            get_active_master_data.clear()
-
-            if email_success_1 and email_success_2:
-                st.sidebar.success(f"✅ Master updated & archived in OneDrive as {backup_filename}!")
+            missing_cols = set(df_master.columns) - set(new_conso_df.columns)
+            if missing_cols:
+                st.sidebar.error(f"❌ Missing columns: {missing_cols}")
             else:
-                st.sidebar.warning(f"⚠️ Updated locally, but OneDrive sync issue: {msg_1} | {msg_2}")
+                # Ensure the local master exists (downloads if missing)
+                _ = get_active_master_data()
 
-            st.rerun()
+                # 1. Overwrite ONLY the 'Conso_Data' sheet inside the multi-sheet workbook
+                try:
+                    with pd.ExcelWriter(MASTER_FILE_PATH, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                        new_conso_df.to_excel(writer, sheet_name="Conso_Data", index=False)
+                except Exception as e:
+                    st.sidebar.error(f"❌ Failed updating Conso_Data sheet in master workbook: {e}")
+                    st.stop()
+
+                # 2. Read the updated multi-sheet workbook bytes to send back to OneDrive
+                with open(MASTER_FILE_PATH, "rb") as f:
+                    updated_master_bytes = f.read()
+
+                # 3. Email 1: Overwrite the permanent live Master File in OneDrive (with all sheets intact)
+                email_success_1, msg_1 = email_file_to_outlook(updated_master_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
+
+                # 4. Email 2: Archive the uploaded monthly data with a standardized name
+                backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
+                email_success_2, msg_2 = email_file_to_outlook(uploaded_bytes, backup_filename)
+
+                get_active_master_data.clear()
+
+                if email_success_1 and email_success_2:
+                    st.sidebar.success(f"✅ Master 'Conso_Data' updated & archived as {backup_filename}!")
+                else:
+                    st.sidebar.warning(f"⚠️ Updated locally, but OneDrive sync issue: {msg_1} | {msg_2}")
+
+                st.rerun()
 
 [df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register] = load_master_data()
 merged_df = build_merged_view()
