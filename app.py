@@ -121,7 +121,10 @@ def get_active_master_data():
             st.stop()
     try:
         # Read specifically the Conso_Data sheet for main dashboard analytics
-        return pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", engine="openpyxl")
+        df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", engine="openpyxl")
+        if "Month-Year" in df.columns:
+            df["Month-Year"] = df["Month-Year"].astype(str)
+        return df
     except Exception as e:
         st.error(f"❌ Failed to read local Master file: {e}")
         st.stop()
@@ -1041,6 +1044,9 @@ uploaded_file = st.sidebar.file_uploader("Upload Monthly Conso Data (.xlsx)", ty
 if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="primary"):
     try:
         new_df = pd.read_excel(uploaded_file, engine="openpyxl")
+        new_df["Year"] = int(upload_year)
+        new_df["Month-Year"] = f"{upload_month}-{upload_year}"
+        new_df["Month-Year"] = new_df["Month-Year"].astype(str)
     except Exception as e:
         st.sidebar.error(f"❌ Unable to read uploaded file: {e}")
     else:
@@ -1053,7 +1059,8 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
             uploaded_bytes = buf.tobytes()
             try:
                 new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
-                # Normalize/ensure a precise Month-Year string column for filtering (e.g., "April-2026")
+                # Stamp Year and Month-Year immediately so validation and later writing use them.
+                new_conso_df["Year"] = int(upload_year)
                 new_conso_df["Month-Year"] = f"{upload_month}-{upload_year}"
                 new_conso_df["Month-Year"] = new_conso_df["Month-Year"].astype(str)
             except Exception as e:
