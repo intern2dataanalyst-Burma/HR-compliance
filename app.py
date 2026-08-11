@@ -63,7 +63,8 @@ DATA_CANDIDATES = [
 TEMPLATES_DIR = BASE_DIR / "templates"
 
 # Constants for master file sync
-MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.XLSX"
+# Use lowercase .xlsx so pd.ExcelWriter accepts the extension
+MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.xlsx"
 ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/interndataanalyst2_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
 
 # 1. Automatically create .streamlit/config.toml and enable static file serving if missing
@@ -1080,7 +1081,8 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
 
                 # 4. Email 2: Archive the uploaded monthly data with a standardized name
                 backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
-                email_success_2, msg_2 = email_file_to_outlook(uploaded_bytes, backup_filename)
+                # Use the original uploaded buffer for the backup email (memoryview accepted)
+                email_success_2, msg_2 = email_file_to_outlook(uploaded_file.getbuffer(), backup_filename)
 
                 get_active_master_data.clear()
 
