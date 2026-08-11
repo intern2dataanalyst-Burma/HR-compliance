@@ -104,15 +104,23 @@ def get_active_master_data():
     if not os.path.exists(MASTER_FILE_PATH):
         try:
             os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
-            response = requests.get(ONEDRIVE_MASTER_URL, timeout=20)
+            response = requests.get(ONEDRIVE_MASTER_URL, timeout=30, allow_redirects=True)
             response.raise_for_status()
+
+            # Guard against HTML redirect pages being returned instead of an Excel file
+            head = response.content[:200].lower()
+            if b"<html" in head or b"<!doctype html" in head:
+                st.error("❌ OneDrive URL returned a webpage instead of an Excel file. Please check share link permissions.")
+                st.stop()
+
             with open(MASTER_FILE_PATH, "wb") as f:
                 f.write(response.content)
         except Exception as e:
             st.error(f"❌ Failed to fetch Master Data from OneDrive: {e}")
             st.stop()
     try:
-        return pd.read_excel(MASTER_FILE_PATH)
+        # Explicit engine to avoid ambiguous-format errors
+        return pd.read_excel(MASTER_FILE_PATH, engine="openpyxl")
     except Exception as e:
         st.error(f"❌ Failed to read local Master file: {e}")
         st.stop()
@@ -1022,10 +1030,16 @@ df_master = get_active_master_data()
 
 # Sidebar: Update Master Data
 st.sidebar.subheader("📥 Update Master Data")
+months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+years = [2025, 2026, 2027, 2028, 2029, 2030]
+
+upload_month = st.sidebar.selectbox("Select Data Month", months)
+upload_year = st.sidebar.selectbox("Select Data Year", years, index=1)
+
 uploaded_file = st.sidebar.file_uploader("Upload Monthly Conso Data (.xlsx)", type=["xlsx"])
 if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="primary"):
     try:
-        new_df = pd.read_excel(uploaded_file)
+        new_df = pd.read_excel(uploaded_file, engine="openpyxl")
     except Exception as e:
         st.sidebar.error(f"❌ Unable to read uploaded file: {e}")
     else:
@@ -1033,22 +1047,25 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         if missing_cols:
             st.sidebar.error(f"❌ Missing columns: {missing_cols}")
         else:
-            file_bytes = uploaded_file.read()
+            buf = uploaded_file.getbuffer()
+            file_bytes = buf.tobytes()
+
             # 1. Overwrite the Streamlit Local File
             os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
             with open(MASTER_FILE_PATH, "wb") as f:
                 f.write(file_bytes)
 
-            # 2. Email 1: Triggers "Update file" in Power Automate
+            # 2. Email 1: Triggers "Update file" in Power Automate (Live Master)
             email_success_1, msg_1 = email_file_to_outlook(file_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
 
-            # 3. Email 2: Triggers "Create file" in Power Automate for historical backup
-            email_success_2, msg_2 = email_file_to_outlook(file_bytes, uploaded_file.name)
+            # 3. Email 2: Triggers "Create file" in Power Automate for standardized historical backup
+            backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
+            email_success_2, msg_2 = email_file_to_outlook(file_bytes, backup_filename)
 
             get_active_master_data.clear()
 
             if email_success_1 and email_success_2:
-                st.sidebar.success(f"✅ Master updated & archived in OneDrive as {uploaded_file.name}!")
+                st.sidebar.success(f"✅ Master updated & archived in OneDrive as {backup_filename}!")
             else:
                 st.sidebar.warning(f"⚠️ Updated locally, but OneDrive sync issue: {msg_1} | {msg_2}")
 
