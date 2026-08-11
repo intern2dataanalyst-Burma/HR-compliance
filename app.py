@@ -62,6 +62,10 @@ DATA_CANDIDATES = [
 ]
 TEMPLATES_DIR = BASE_DIR / "templates"
 
+# Constants for master file sync
+MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.XLSX"
+ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/interndataanalyst2_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
+
 # 1. Automatically create .streamlit/config.toml and enable static file serving if missing
 config_dir = BASE_DIR / ".streamlit"
 config_dir.mkdir(parents=True, exist_ok=True)
@@ -89,6 +93,29 @@ else:
 
 if ONEDRIVE_ARCHIVE_DIR:
     ONEDRIVE_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@st.cache_data(ttl=3600)
+def get_active_master_data():
+    """
+    Ensure a local copy of the master file exists (download from OneDrive if missing)
+    and return it as a pandas DataFrame. Cached for 1 hour.
+    """
+    if not os.path.exists(MASTER_FILE_PATH):
+        try:
+            os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
+            response = requests.get(ONEDRIVE_MASTER_URL, timeout=20)
+            response.raise_for_status()
+            with open(MASTER_FILE_PATH, "wb") as f:
+                f.write(response.content)
+        except Exception as e:
+            st.error(f"❌ Failed to fetch Master Data from OneDrive: {e}")
+            st.stop()
+    try:
+        return pd.read_excel(MASTER_FILE_PATH)
+    except Exception as e:
+        st.error(f"❌ Failed to read local Master file: {e}")
+        st.stop()
 
 
 def email_file_to_outlook(file_bytes, filename):
@@ -157,10 +184,18 @@ def normalize_unit_key(value: object) -> str:
 
 def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     try:
-        excel_url = st.secrets["EXCEL_FILE_URL"]
-        response = requests.get(excel_url, timeout=15)
-        response.raise_for_status()
-        file_bytes = io.BytesIO(response.content)
+        # Prefer a locally cached master file if present (keeps app responsive
+        # to uploads). Otherwise fall back to the configured secret URL.
+        if Path(MASTER_FILE_PATH).exists():
+            with open(MASTER_FILE_PATH, "rb") as f:
+                file_bytes = io.BytesIO(f.read())
+        else:
+            excel_url = st.secrets.get("EXCEL_FILE_URL")
+            if not excel_url:
+                raise RuntimeError("EXCEL_FILE_URL not configured in secrets and no local master file present.")
+            response = requests.get(excel_url, timeout=15)
+            response.raise_for_status()
+            file_bytes = io.BytesIO(response.content)
 
         # Load data sheets (skipping row 1 because headers start on row 2)
         df_conso = pd.read_excel(file_bytes, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
@@ -982,6 +1017,42 @@ header_html = """
 </div>
 """
 st.markdown(header_html, unsafe_allow_html=True)
+# Load a cached/simple master view for uploader validation
+df_master = get_active_master_data()
+
+# Sidebar: Update Master Data
+st.sidebar.subheader("📥 Update Master Data")
+uploaded_file = st.sidebar.file_uploader("Upload Monthly Conso Data (.xlsx)", type=["xlsx"])
+if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="primary"):
+    try:
+        new_df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.sidebar.error(f"❌ Unable to read uploaded file: {e}")
+    else:
+        missing_cols = set(df_master.columns) - set(new_df.columns)
+        if missing_cols:
+            st.sidebar.error(f"❌ Missing columns: {missing_cols}")
+        else:
+            file_bytes = uploaded_file.read()
+            # 1. Overwrite the Streamlit Local File
+            os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
+            with open(MASTER_FILE_PATH, "wb") as f:
+                f.write(file_bytes)
+
+            # 2. Email 1: Triggers "Update file" in Power Automate
+            email_success_1, msg_1 = email_file_to_outlook(file_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
+
+            # 3. Email 2: Triggers "Create file" in Power Automate for historical backup
+            email_success_2, msg_2 = email_file_to_outlook(file_bytes, uploaded_file.name)
+
+            get_active_master_data.clear()
+
+            if email_success_1 and email_success_2:
+                st.sidebar.success(f"✅ Master updated & archived in OneDrive as {uploaded_file.name}!")
+            else:
+                st.sidebar.warning(f"⚠️ Updated locally, but OneDrive sync issue: {msg_1} | {msg_2}")
+
+            st.rerun()
 
 [df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register] = load_master_data()
 merged_df = build_merged_view()
@@ -1136,7 +1207,7 @@ def clear_archive_directory(target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
 
 
-tab1, tab2 = st.tabs(["⚡ Statutory Form Generator", "📁 OneDrive Form Archive"])
+tab1, tab2 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms"])
 
 with tab1:
     st.markdown("### Selection Filters")
