@@ -120,10 +120,16 @@ def get_active_master_data():
             st.error(f"❌ Failed to fetch Master Data from OneDrive: {e}")
             st.stop()
     try:
-        # Read specifically the Conso_Data sheet for main dashboard analytics
-        df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", engine="openpyxl")
+        # skiprows=1 is REQUIRED: row 1 of Conso_Data is a spreadsheet
+        # column-letter reference row ("A", "B", "C"...), not real headers -
+        # real field names are on row 2. Without this, every column name
+        # comes out as a letter, which made the upload's "missing columns"
+        # check compare against garbage and fail on every single upload.
+        # This must match load_master_data()'s reading of the same sheet.
+        df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
+        df.columns = df.columns.astype(str).str.strip()
         if "Month-Year" in df.columns:
-            df["Month-Year"] = df["Month-Year"].astype(str)
+            df["Month-Year"] = df["Month-Year"].astype(str).str.strip()
         return df
     except Exception as e:
         st.error(f"❌ Failed to read local Master file: {e}")
@@ -183,7 +189,40 @@ def email_file_to_outlook(file_bytes, filename):
         return False, f"Email dispatch skipped/failed: {str(e)}"
 
 
-@st.cache_data(show_spinner=False, ttl=300)
+def write_conso_data_sheet(master_path: str, new_df: pd.DataFrame) -> None:
+    """Overwrite ONLY the Conso_Data sheet in the multi-sheet master
+    workbook, preserving every other sheet (Units_Master, Coloums, Sheet1)
+    completely untouched. Reproduces the sheet's exact original layout -
+    row 1 = spreadsheet column-letter labels (A, B, C...), row 2 = real
+    field headers, row 3+ = data - because the rest of the pipeline
+    (load_master_data, get_active_master_data) relies on skiprows=1 to
+    find the real header row. Using pandas' plain to_excel() here would
+    write headers at row 1 instead, silently shifting every column by one
+    row on the very next read after an upload."""
+    workbook = load_workbook(master_path)
+    if "Conso_Data" in workbook.sheetnames:
+        sheet_index = workbook.sheetnames.index("Conso_Data")
+        del workbook["Conso_Data"]
+        sheet = workbook.create_sheet("Conso_Data", sheet_index)
+    else:
+        sheet = workbook.create_sheet("Conso_Data")
+
+    columns = list(new_df.columns)
+    for col_idx, column_name in enumerate(columns, start=1):
+        sheet.cell(row=1, column=col_idx, value=get_column_letter(col_idx))
+        sheet.cell(row=2, column=col_idx, value=str(column_name))
+
+    for row_offset, row in enumerate(new_df.itertuples(index=False, name=None), start=3):
+        for col_idx, value in enumerate(row, start=1):
+            if pd.isna(value):
+                value = None
+            elif hasattr(value, "isoformat"):
+                pass  # keep real datetime/date objects as-is for correct Excel formatting
+            sheet.cell(row=row_offset, column=col_idx, value=value)
+
+    workbook.save(master_path)
+
+
 def normalize_unit_key(value: object) -> str:
     """Normalize a unit name for matching between Conso_Data and
     Units_Master. Verified against the real master file: the two sheets
@@ -1040,68 +1079,137 @@ years = [2025, 2026, 2027, 2028, 2029, 2030]
 upload_month = st.sidebar.selectbox("Select Data Month", months)
 upload_year = st.sidebar.selectbox("Select Data Year", years, index=1)
 
+_legacy_row_count = (
+    int(df_master["Month-Year"].isna().sum()) if "Month-Year" in df_master.columns else len(df_master)
+)
+clear_legacy_rows = False
+if _legacy_row_count:
+    st.sidebar.warning(
+        f"⚠️ {_legacy_row_count} existing rows have no Month-Year (from before monthly tracking was added). "
+        "They'll be kept as-is unless cleared below."
+    )
+    clear_legacy_rows = st.sidebar.checkbox(
+        f"Clear these {_legacy_row_count} untracked legacy rows on next upload",
+        value=False,
+        help="Leave unchecked to keep them untouched alongside every future monthly upload. "
+             "Check this once your monthly uploads have caught up to replace them.",
+    )
+
 uploaded_file = st.sidebar.file_uploader("Upload Monthly Conso Data (.xlsx)", type=["xlsx"])
 if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="primary"):
     try:
-        new_df = pd.read_excel(uploaded_file, engine="openpyxl")
-        new_df["Year"] = int(upload_year)
-        new_df["Month-Year"] = f"{upload_month}-{upload_year}"
-        new_df["Month-Year"] = new_df["Month-Year"].astype(str)
+        uploaded_bytes = uploaded_file.getbuffer().tobytes()
+        new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
+        new_conso_df.columns = new_conso_df.columns.astype(str).str.strip()
+
+        # Requirement 2: stamp Month/Year IMMEDIATELY, before any validation
+        # runs, so the required-column check never fails on columns that
+        # this upload step itself is responsible for adding.
+        new_conso_df["Year"] = int(upload_year)
+        new_conso_df["Month-Year"] = f"{upload_month}-{upload_year}"
+        new_conso_df["Month-Year"] = new_conso_df["Month-Year"].astype(str).str.strip()
     except Exception as e:
         st.sidebar.error(f"❌ Unable to read uploaded file: {e}")
+        st.stop()
+
+    missing_cols = set(df_master.columns) - set(new_conso_df.columns)
+    if missing_cols:
+        st.sidebar.error(f"❌ Missing columns: {missing_cols}")
     else:
-        missing_cols = set(df_master.columns) - set(new_df.columns)
-        if missing_cols:
-            st.sidebar.error(f"❌ Missing columns: {missing_cols}")
+        # Ensure the local master exists (downloads it first if missing).
+        _ = get_active_master_data()
+
+        # Read the FULL existing accumulated Conso_Data (every month ever
+        # uploaded so far) directly from the master file - df_master was
+        # loaded before this button was clicked and may be stale if two
+        # uploads happen in the same session.
+        try:
+            existing_df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
+            existing_df.columns = existing_df.columns.astype(str).str.strip()
+        except Exception as e:
+            st.sidebar.error(f"❌ Failed reading existing master data before append: {e}")
+            st.stop()
+
+        # Normalize the employee-code column's dtype before concatenating -
+        # different monthly uploads can read Code as int64 in one file and
+        # string in another, which otherwise produces a mixed-type column
+        # that breaks Code matching (Sr.No/QA/report lookups) downstream.
+        code_col = next((c for c in existing_df.columns if "code" in c.lower()), None)
+        if code_col and code_col in new_conso_df.columns:
+            existing_df[code_col] = existing_df[code_col].astype(str).str.strip()
+            new_conso_df[code_col] = new_conso_df[code_col].astype(str).str.strip()
+
+        target_month_year = new_conso_df["Month-Year"].iloc[0] if not new_conso_df.empty else f"{upload_month}-{upload_year}"
+
+        # Month-level upsert: this upload is authoritative for that whole
+        # month, so drop every existing row for that exact Month-Year (a
+        # re-upload cleanly replaces the month rather than leaving stale
+        # rows behind) then append the new month on top.
+        if "Month-Year" in existing_df.columns:
+            existing_my = existing_df["Month-Year"].astype(str).str.strip()
+            is_legacy = existing_df["Month-Year"].isna() | existing_my.isin({"", "nan", "None"})
+            is_target_month = (~is_legacy) & existing_my.eq(str(target_month_year).strip())
         else:
-            # Read uploaded bytes and parse only the first sheet (new Conso_Data)
-            buf = uploaded_file.getbuffer()
-            uploaded_bytes = buf.tobytes()
-            try:
-                new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
-                # Stamp Year and Month-Year immediately so validation and later writing use them.
-                new_conso_df["Year"] = int(upload_year)
-                new_conso_df["Month-Year"] = f"{upload_month}-{upload_year}"
-                new_conso_df["Month-Year"] = new_conso_df["Month-Year"].astype(str)
-            except Exception as e:
-                st.sidebar.error(f"❌ Unable to parse uploaded Excel (first sheet): {e}")
-                st.stop()
+            # No Month-Year column exists at all yet - every existing row
+            # predates this feature and counts as legacy.
+            is_legacy = pd.Series(True, index=existing_df.index)
+            is_target_month = pd.Series(False, index=existing_df.index)
 
-            missing_cols = set(df_master.columns) - set(new_conso_df.columns)
-            if missing_cols:
-                st.sidebar.error(f"❌ Missing columns: {missing_cols}")
-            else:
-                # Ensure the local master exists (downloads if missing)
-                _ = get_active_master_data()
+        keep_mask = ~is_target_month
+        if clear_legacy_rows:
+            keep_mask &= ~is_legacy
+        existing_minus_month = existing_df[keep_mask]
+        months_replaced = int(is_target_month.sum())
+        legacy_cleared = int(is_legacy.sum()) if clear_legacy_rows else 0
 
-                # 1. Overwrite ONLY the 'Conso_Data' sheet inside the multi-sheet workbook
-                try:
-                    with pd.ExcelWriter(MASTER_FILE_PATH, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                        new_conso_df.to_excel(writer, sheet_name="Conso_Data", index=False)
-                except Exception as e:
-                    st.sidebar.error(f"❌ Failed updating Conso_Data sheet in master workbook: {e}")
-                    st.stop()
+        combined_df = pd.concat([existing_minus_month, new_conso_df], ignore_index=True, sort=False)
 
-                # 2. Read the updated multi-sheet workbook bytes to send back to OneDrive
-                with open(MASTER_FILE_PATH, "rb") as f:
-                    updated_master_bytes = f.read()
+        # 1a. Overwrite the Conso_Data sheet with the COMBINED (multi-month)
+        # data, preserving every other sheet (Units_Master, Coloums, Sheet1)
+        # and the exact row layout the rest of the app depends on.
+        try:
+            write_conso_data_sheet(MASTER_FILE_PATH, combined_df)
+        except Exception as e:
+            st.sidebar.error(f"❌ Failed updating Conso_Data sheet in master workbook: {e}")
+            st.stop()
 
-                # 3. Email 1: Overwrite the permanent live Master File in OneDrive (with all sheets intact)
-                email_success_1, msg_1 = email_file_to_outlook(updated_master_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
+        # 1b. Read the FRESH multi-sheet workbook bytes back from disk -
+        # never reuse in-memory bytes from before the write - so what gets
+        # emailed is guaranteed to be exactly what's now on disk.
+        with open(MASTER_FILE_PATH, "rb") as f:
+            updated_master_bytes = f.read()
 
-                # 4. Email 2: Archive the uploaded monthly data with a standardized name
-                backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
-                # Use the original uploaded buffer for the backup email (memoryview accepted)
-                email_success_2, msg_2 = email_file_to_outlook(uploaded_file.getbuffer(), backup_filename)
+        # 1c. Email 1: strictly-cased filename so Power Automate's Condition
+        # matches it and triggers the OneDrive "Update file" action.
+        email_success_1, msg_1 = email_file_to_outlook(updated_master_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
 
-                get_active_master_data.clear()
+        # 1d. Email 2: the archive copy carries the STAMPED data (with
+        # Year/Month-Year already added) so the OneDrive archive matches
+        # what's actually in the live master, not the raw upload.
+        archive_buffer = BytesIO()
+        with pd.ExcelWriter(archive_buffer, engine="openpyxl") as writer:
+            new_conso_df.to_excel(writer, sheet_name="Conso_Data", index=False)
+        archive_buffer.seek(0)
+        backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
+        email_success_2, msg_2 = email_file_to_outlook(archive_buffer.getvalue(), backup_filename)
 
-                if email_success_1 and email_success_2:
-                    st.sidebar.success(f"✅ Master 'Conso_Data' updated & archived as {backup_filename}!")
-                else:
-                    st.sidebar.warning(f"⚠️ Updated locally, but OneDrive sync issue: {msg_1} | {msg_2}")
+        # Requirement 4: a GLOBAL cache wipe - clearing only
+        # get_active_master_data() left build_merged_view() (which
+        # actually feeds the dashboard/filters/form generator) stale.
+        st.cache_data.clear()
 
-                st.rerun()
+        if email_success_1 and email_success_2:
+            months_now = combined_df["Month-Year"].nunique() if "Month-Year" in combined_df.columns else 1
+            replace_note = f" (replaced {int(months_replaced)} existing rows for this month)" if months_replaced else ""
+            legacy_note = f" Cleared {legacy_cleared} untracked legacy rows." if legacy_cleared else ""
+            st.sidebar.success(
+                f"✅ Appended {target_month_year} ({len(new_conso_df)} employees){replace_note}.{legacy_note} "
+                f"Master now holds {months_now} month(s), {len(combined_df)} total rows. Archived as {backup_filename}!"
+            )
+        else:
+            st.sidebar.warning(f"⚠️ Updated locally, but OneDrive sync issue: {msg_1} | {msg_2}")
+
+        st.rerun()
 
 [df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register] = load_master_data()
 merged_df = build_merged_view()
@@ -1337,6 +1445,9 @@ with tab1:
                 key="selected_form",
             )
             if st.button("Generate Selected Form", key="generate_selected"):
+                if selected_month in {"All", "", None}:
+                    st.error("❌ Select a specific Month-Year before generating a statutory form - 'All' would mix multiple months' payroll for the same employee, which isn't a valid compliance form.")
+                    st.stop()
                 with st.status("⚡ Generating forms and pushing to cloud OneDrive...", expanded=True) as status:
                     status.write("📄 Compiling statutory form templates...")
                     generated, errors, archive_dir = compile_statutory_forms(
@@ -1379,6 +1490,9 @@ with tab1:
 
         with gen_col2:
             if st.button("Generate All Forms (ZIP)", key="generate_bulk"):
+                if selected_month in {"All", "", None}:
+                    st.error("❌ Select a specific Month-Year before generating statutory forms - 'All' would mix multiple months' payroll for the same employee, which isn't a valid compliance form.")
+                    st.stop()
                 with st.status("⚡ Generating forms and pushing to cloud OneDrive...", expanded=True) as status:
                     status.write("📄 Compiling statutory form templates...")
                     all_forms = ["Form A", "Form C", "Form D", "Form E", "Form IV", "Form V"]
