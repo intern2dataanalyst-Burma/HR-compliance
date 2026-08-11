@@ -341,13 +341,13 @@ def build_merged_view() -> pd.DataFrame:
         df["Unit_Display"] = pd.Series(["" for _ in range(len(df))])
         df["Unit_Clean"] = pd.Series(["" for _ in range(len(df))])
 
-    month_candidate = next((col for col in ["Month Year", "Month", "Pay Month", "Month_Year", "Period", "For the Month", "Date"] if col in df.columns), None)
+    month_candidate = next((col for col in ["Month-Year", "Month Year", "Month", "Pay Month", "Month_Year", "Period", "For the Month", "Date"] if col in df.columns), None)
     if month_candidate is not None:
-        df["Month Year"] = df[month_candidate]
+        df["Month-Year"] = df[month_candidate]
     else:
         df["Month Year"] = pd.Series(["" for _ in range(len(df))])
 
-    for column in ["Employee Name", "Department", "Designation", "Unit_Raw", "Unit_Display", "State", "Month Year"]:
+    for column in ["Employee Name", "Department", "Designation", "Unit_Raw", "Unit_Display", "State", "Month-Year"]:
         if column in df.columns:
             df[column] = df[column].fillna("")
 
@@ -668,7 +668,7 @@ def get_value_for_header(
     if "net" in normalized or "salary" in normalized:
         return row.get("Net Paid", "")
     if "month" in normalized or "period" in normalized:
-        return row.get("Month Year", "")
+        return row.get("Month-Year", "")
     return ""
 
 
@@ -1053,6 +1053,9 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
             uploaded_bytes = buf.tobytes()
             try:
                 new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
+                # Normalize/ensure a precise Month-Year string column for filtering (e.g., "April-2026")
+                new_conso_df["Month-Year"] = f"{upload_month}-{upload_year}"
+                new_conso_df["Month-Year"] = new_conso_df["Month-Year"].astype(str)
             except Exception as e:
                 st.sidebar.error(f"❌ Unable to parse uploaded Excel (first sheet): {e}")
                 st.stop()
@@ -1278,8 +1281,8 @@ with tab1:
             st.info("Unit column not found; using all records.")
 
     with col3:
-        if "Month Year" in merged_df.columns:
-            month_list = ["All"] + sorted(merged_df["Month Year"].dropna().astype(str).unique().tolist())
+        if "Month-Year" in merged_df.columns:
+            month_list = ["All"] + sorted(merged_df["Month-Year"].dropna().astype(str).unique().tolist())
         else:
             month_list = ["All"]
         selected_month = st.selectbox("Month-Year", month_list, key="selected_month", on_change=reset_forms)
@@ -1295,8 +1298,8 @@ with tab1:
     if selected_unit != "All" and "Unit_Display" in filtered_df.columns:
         filtered_df = filtered_df[filtered_df["Unit_Display"].astype(str) == str(selected_unit)]
 
-    if selected_month not in {"All", "", None} and "Month Year" in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df["Month Year"].astype(str) == str(selected_month)]
+    if selected_month not in {"All", "", None} and "Month-Year" in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df["Month-Year"].astype(str) == str(selected_month)]
 
     total_emps = len(filtered_df)
     kpi_html = f"""
