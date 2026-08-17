@@ -65,7 +65,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 # Constants for master file sync
 # Use lowercase .xlsx so pd.ExcelWriter accepts the extension
 MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.xlsx"
-ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/interndataanalyst2_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
+ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
 
 # 1. Automatically create .streamlit/config.toml and enable static file serving if missing
 config_dir = BASE_DIR / ".streamlit"
