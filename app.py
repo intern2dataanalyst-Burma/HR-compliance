@@ -712,11 +712,6 @@ def get_value_for_header(
         return row.get("Total Deductions", "")
     if "net" in normalized or "salary" in normalized:
         return row.get("Net Paid", "")
-    if "wage" in normalized and ("payable" in normalized or "due" in normalized):
-        # Safety net for any Form E/D column beyond Sheet1's mapped rule
-        # slots (e.g. a "Wages Payable"/"Wages Due" header with no explicit
-        # Col- rule) - falls back to Net Paid rather than staying blank.
-        return row.get("Net Paid", "")
     if "month" in normalized or "period" in normalized:
         return row.get("Month-Year", "")
     return ""
@@ -778,38 +773,6 @@ def copy_cell_style(source_cell, target_cell) -> None:
         target_cell.fill = copy(source_cell.fill)
         target_cell.number_format = copy(source_cell.number_format)
         target_cell.alignment = copy(source_cell.alignment)
-
-
-FORMULA_CELL_REF_RE = re.compile(r"\$?([A-Za-z]{1,3})\$?\d+")
-
-
-def collect_formula_referenced_columns(sheet) -> set[str]:
-    """Scan every formula cell in the template and collect the column
-    letters it references (e.g. '=N10+M10' -> {'N', 'M'}). Used so numeric
-    fallback values (0) are injected into columns that feed a live Excel
-    formula elsewhere in the sheet, instead of a text constant like 'Nil'
-    or 'N.A.' that would break the formula with a #VALUE! error."""
-    referenced_columns: set[str] = set()
-    for row in sheet.iter_rows():
-        for cell in row:
-            value = cell.value
-            if isinstance(value, str) and value.startswith("="):
-                for match in FORMULA_CELL_REF_RE.finditer(value):
-                    referenced_columns.add(match.group(1).upper())
-    return referenced_columns
-
-
-def _is_zero_like(value: object) -> bool:
-    """True if a template's original constant for a cell is a literal 0
-    (int/float 0, or the string '0'/'0.0') - the signal that this column
-    holds numeric data even when a specific employee's value is blank."""
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, (int, float)):
-        return value == 0
-    if isinstance(value, str):
-        return value.strip() in {"0", "0.0", "0.00"}
-    return False
 
 
 def write_header_month(sheet, selected_month: str, selected_year: int | None = None) -> None:
@@ -1048,11 +1011,11 @@ def apply_column_widths_and_number_formats(
                     is_numeric_column = False
 
         if any_value:
-            # Strict minimum of 15 so date/time columns (e.g. "11:30:00 PM",
+            # Strict minimum of 14 so date/time columns (e.g. "11:30:00 PM",
             # "01-Jan-1999") never render as "#####" in Excel - a narrower
             # auto-fit width can fit the digit count but still be too small
             # for Excel's date/time column-width rendering rules.
-            sheet.column_dimensions[col_letter].width = max(max_len + 2, 15)
+            sheet.column_dimensions[col_letter].width = max(max_len + 2, 14)
 
         if any_value and is_numeric_column:
             number_format = "#,##0.00" if has_decimal else "#,##0"
@@ -1114,13 +1077,22 @@ def generate_dynamic_form(
 
     data_col_count = min(sheet.max_column, 51)
 
-    # Pre-scan the template for columns that feed a live Excel formula
-    # (e.g. Form IV's "Total earning" = Normal earnings + Over-time earning)
-    # so that when an employee's value for one of those feeder columns is
-    # missing, we fall back to the integer 0 instead of a text constant
-    # like "Nil"/"N.A." - a text fallback there breaks the formula and
-    # shows #VALUE! in Excel.
-    formula_referenced_columns = collect_formula_referenced_columns(sheet)
+    # Some templates (Form IV's "Total earning" = "=N{row}+M{row}") have a
+    # live per-row formula. Any column that formula references must always
+    # end up holding a real number - even when the master's own Sheet1 rule
+    # is an intentional literal like "Nil (Fixed Text)" (a legitimate,
+    # correct value to DISPLAY, but not one Excel can add to a number).
+    # Detect this generically by scanning the template's first data row for
+    # formula cells and parsing which columns they reference, rather than
+    # hardcoding "Form IV column N" - this then applies to any current or
+    # future template with the same pattern.
+    formula_input_columns: set[int] = set()
+    cell_ref_scan_pattern = re.compile(r"\$?([A-Za-z]{1,3})\$?(\d+)")
+    for col_idx in range(1, data_col_count + 1):
+        probe_value = sheet.cell(row=start_row, column=col_idx).value
+        if isinstance(probe_value, str) and probe_value.startswith("="):
+            for ref_col_letters, _ in cell_ref_scan_pattern.findall(probe_value):
+                formula_input_columns.add(column_letter_to_index(ref_col_letters))
 
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
@@ -1194,40 +1166,20 @@ def generate_dynamic_form(
                 or (isinstance(cell_value, str) and cell_value.strip() == "")
                 or (not isinstance(cell_value, (list, dict)) and pd.isna(cell_value))
             )
-
-            col_letter_for_cell = get_column_letter(col_idx)
-            is_numeric_feeder_column = (
-                _is_zero_like(template_constant) or col_letter_for_cell in formula_referenced_columns
-            )
-
-            # A Sheet1 rule can itself explicitly resolve to a text
-            # placeholder like "Nil ( Fixed Text)" or "N.A.(Fixed Text)"
-            # (verified against the real master: FORM IV's "Over-time
-            # earning" column rule is literally "Nil ( Fixed Text)"). That
-            # is NOT a blank/missing result - resolve_col_rule() returns it
-            # as a normal non-empty string - so the blank-fallback branch
-            # above never catches it. If this column feeds a live formula
-            # (e.g. Form IV's "Total earning" = Normal earnings + Over-time
-            # earning), writing the literal word "Nil" into it breaks the
-            # formula into #VALUE!. Catch that case explicitly, independent
-            # of is_blank_result.
-            is_nil_text_placeholder = isinstance(cell_value, str) and cell_value.strip().lower() in {
-                "nil", "n.a.", "na", "n/a", "none",
-            }
-
-            if is_numeric_feeder_column and (is_blank_result or is_nil_text_placeholder):
-                # This column feeds a live formula (or the template itself
-                # shows 0 for it) - always use the integer 0, never a text
-                # constant like "Nil"/"N.A." (even one that came from an
-                # explicit Sheet1 rule), so downstream formulas like
-                # "=N10+M10" never break into #VALUE!.
-                cell_value = 0
-            elif is_blank_result and template_constant is not None and str(template_constant).strip() != "":
+            if is_blank_result and template_constant is not None and str(template_constant).strip() != "":
                 cell_value = template_constant
             elif is_blank_result:
                 # No usable template constant either - write a real empty
                 # string rather than a stray NaN/NaT making it into the cell.
                 cell_value = ""
+
+            if col_idx in formula_input_columns and not _is_numeric_or_formula_value(cell_value):
+                # This column feeds a live formula elsewhere in the row
+                # (e.g. Form IV's Total earning = Normal + Over-time
+                # earning). A non-numeric result here - even an
+                # intentional, correct value like "Nil" - would turn the
+                # formula's result into #VALUE!, so it must be a real 0.
+                cell_value = 0
 
             safe_write(sheet, f"{get_column_letter(col_idx)}{row_idx}", cell_value)
 
