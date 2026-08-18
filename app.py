@@ -1099,7 +1099,7 @@ uploaded_file = st.sidebar.file_uploader("Upload Monthly Conso Data (.xlsx)", ty
 if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="primary"):
     try:
         uploaded_bytes = uploaded_file.getbuffer().tobytes()
-        new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
+        new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl", skiprows=1)
         new_conso_df.columns = new_conso_df.columns.astype(str).str.strip()
 
         # Requirement 2: stamp Month/Year IMMEDIATELY, before any validation
