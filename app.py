@@ -616,12 +616,15 @@ def resolve_col_rule(
         for part in rule_text.split("+"):
             letter = _extract_col_letter(part)
             value = _lookup_col_ref_value(letter, df_col_ref, row_data)
-            if value not in (None, ""):
-                try:
-                    total += float(value)
-                    any_value = True
-                except (TypeError, ValueError):
-                    pass
+            if value is None or value == "" or pd.isna(value):
+                # Missing/blank source cell for this employee - skip it
+                # rather than letting a NaN silently poison the whole sum.
+                continue
+            try:
+                total += float(value)
+                any_value = True
+            except (TypeError, ValueError):
+                pass
         return total if any_value else ""
 
     if _is_col_prefixed(rule_text):
@@ -736,17 +739,6 @@ def safe_write(sheet, cell_coordinate: str, value) -> None:
 TEMPLATE_MARKER_FILLS = {"FFBDD6EE", "FFFFFF00", "FF9CC2E5"}
 
 
-def is_reference_cell(cell) -> bool:
-    """True for cells filled with the template's yellow 'reference/constant'
-    color - these hold values that are the same for every employee (shift
-    timings, 'Monthly', 'Approved in HRMS', etc.) or are intentionally
-    manual/exception-only fields, and must never be blanked out."""
-    fill = cell.fill
-    if fill and fill.fgColor and fill.fgColor.type == "rgb":
-        return fill.fgColor.rgb == "FFFFFF00"
-    return False
-
-
 def detect_table_end_row(sheet, start_row: int, max_scan: int = 500) -> int:
     """Find the real last pre-formatted employee row by scanning downward
     from start_row for the template's marker fill colors (blue 'to-fill'
@@ -849,7 +841,11 @@ def verify_generated_form(
         return [f"Unable to open generated workbook for QA: {exc}"]
 
     form_key = str(form_name).strip().upper() if form_name else ""
-    start_row = {"FORM A": 19, "FORM C": 9, "FORM D": 8, "FORM E": 9, "FORM IV": 10, "FORM V": 11}.get(form_key, 9)
+    # These are one row LOWER than FORM_START_ROWS in generate_dynamic_form:
+    # generate_dynamic_form deletes the leftover "reference row" (start_row - 1)
+    # right before saving, which shifts every row below it up by one in the
+    # file this function actually opens and inspects.
+    start_row = {"FORM A": 18, "FORM C": 8, "FORM D": 7, "FORM E": 8, "FORM IV": 9, "FORM V": 10}.get(form_key, 8)
     known_codes = known_codes or set()
 
     for row_idx in range(1, start_row):
@@ -894,17 +890,6 @@ def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | N
         if pd.notna(candidate) and str(candidate).strip().upper() == target:
             return row_idx
     return None
-
-
-def _drop_ref_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop any hidden/intermediate 'ref' columns left over from pandas
-    calculations (e.g. 'Unit_Ref', 'ref', 'Code_ref') before a dataframe's
-    values are used to populate an exported form. Matches whole words only
-    ('ref'/'reference' as a standalone token or _-joined) so real fields
-    that merely contain the substring aren't accidentally dropped."""
-    ref_pattern = re.compile(r"^(ref|reference)$|(^|[_\s])(ref|reference)([_\s]|$)", re.IGNORECASE)
-    ref_cols = [c for c in df.columns if ref_pattern.search(str(c).strip())]
-    return df.drop(columns=ref_cols) if ref_cols else df
 
 
 def _is_numeric_or_formula_value(value: object) -> bool:
@@ -1026,7 +1011,11 @@ def apply_column_widths_and_number_formats(
                     is_numeric_column = False
 
         if any_value:
-            sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 8), 40)
+            # Strict minimum of 14 so date/time columns (e.g. "11:30:00 PM",
+            # "01-Jan-1999") never render as "#####" in Excel - a narrower
+            # auto-fit width can fit the digit count but still be too small
+            # for Excel's date/time column-width rendering rules.
+            sheet.column_dimensions[col_letter].width = max(max_len + 2, 14)
 
         if any_value and is_numeric_column:
             number_format = "#,##0.00" if has_decimal else "#,##0"
@@ -1050,8 +1039,6 @@ def generate_dynamic_form(
     template_source.seek(0)
     workbook = load_workbook(template_source)
     sheet = workbook.active
-
-    filtered_df = _drop_ref_columns(filtered_df)
 
     write_header_month(sheet, selected_month, selected_year)
     if form_name:
@@ -1097,11 +1084,12 @@ def generate_dynamic_form(
             source_cell = sheet.cell(row=start_row, column=col_idx)
             copy_cell_style(source_cell, target_cell)
 
-            # Yellow cells hold constants that are the same for every employee
-            # (shift timings, "Monthly", "Approved in HRMS", "NIL") or are
-            # exception-only manual fields - never overwrite them.
-            if is_reference_cell(source_cell):
-                continue
+            # Preserve the template's original constant for this column
+            # (e.g. shift timing "11:30 AM", "Monthly", "N.A.", "NIL") so
+            # it's available as a fallback if the employee's computed value
+            # turns out to be empty. We no longer skip yellow cells outright
+            # - every cell must be evaluated against the employee's data.
+            template_constant = source_cell.value
 
             # Some templates (Form IV's "Total earning" column) have a live
             # per-row formula already built in - never overwrite a formula
@@ -1144,6 +1132,29 @@ def generate_dynamic_form(
                     df_units=df_units,
                     selected_unit=selected_unit,
                 )
+
+            # Fallback: only when the computed value for THIS employee is
+            # empty/blank do we keep the template's original constant
+            # (e.g. "N.A.", "NIL", "11:30 AM") instead of writing a blank.
+            # A source field that exists but is genuinely unpopulated for
+            # this employee/unit comes back from pandas as NaN/NaT (a float
+            # or pandas-null, not None or "") - pd.isna() catches those too,
+            # which a plain "is None" check was missing. This was the actual
+            # cause of Form E's "Percentage%" column (and any other column
+            # sourced from a blank Conso_Data cell) showing up empty instead
+            # of falling back to the template's constant.
+            is_blank_result = (
+                cell_value is None
+                or (isinstance(cell_value, str) and cell_value.strip() == "")
+                or (not isinstance(cell_value, (list, dict)) and pd.isna(cell_value))
+            )
+            if is_blank_result and template_constant is not None and str(template_constant).strip() != "":
+                cell_value = template_constant
+            elif is_blank_result:
+                # No usable template constant either - write a real empty
+                # string rather than a stray NaN/NaT making it into the cell.
+                cell_value = ""
+
             safe_write(sheet, f"{get_column_letter(col_idx)}{row_idx}", cell_value)
 
         if form_name in wage_month_columns:
@@ -1170,6 +1181,60 @@ def generate_dynamic_form(
 
     last_content_row = totals_row_idx if row_count > 0 else start_row - 1
     apply_column_widths_and_number_formats(sheet, header_row, start_row, last_content_row, data_col_count)
+
+    # Delete the template's leftover "reference row" (e.g. "Sal Reg",
+    # "Emp Mast", "Unit Mast", "Attd Reg" source-annotation labels) that
+    # sits directly above the employee data at start_row - 1. All row
+    # writing/totals math above is already complete, so it's safe to
+    # physically remove this row now - openpyxl's delete_rows shifts every
+    # row below it up by one automatically.
+    reference_row_idx = start_row - 1
+    rows_deleted = 0
+    if reference_row_idx >= 1:
+        sheet.delete_rows(reference_row_idx)
+        rows_deleted = 1
+
+    if rows_deleted:
+        # openpyxl's delete_rows() physically moves cells but does NOT
+        # rewrite formula text - a template formula like "=N10+M10" that
+        # lived on row 10 stays literally "=N10+M10" even after that row's
+        # content shifts up to row 9. Left alone, every per-row formula in
+        # the data block (e.g. Form IV's "Total earning" column) would end
+        # up one row off and read a neighbouring employee's figures instead
+        # of its own - this was the actual cause of the "missing"/wrong
+        # data in Form IV and Form E. Walk the shifted employee/totals rows
+        # and shift every cell-reference row number in each formula down by
+        # the number of rows deleted above it, so each row's formula still
+        # points at its own row.
+        cell_ref_pattern = re.compile(r"(\$?[A-Za-z]{1,3})(\$?)(\d+)")
+        formula_scan_start = max(1, reference_row_idx)
+        formula_scan_end = sheet.max_row
+        for row_idx in range(formula_scan_start, formula_scan_end + 1):
+            for col_idx in range(1, sheet.max_column + 1):
+                cell = sheet.cell(row=row_idx, column=col_idx)
+                value = cell.value
+                if not (isinstance(value, str) and value.startswith("=")):
+                    continue
+
+                def _shift_ref(match: "re.Match[str]") -> str:
+                    col_part, dollar, row_part = match.group(1), match.group(2), match.group(3)
+                    if dollar == "$":
+                        # Absolute row reference (e.g. "$A$1") - a fixed
+                        # anchor like a header row, never a per-row cell -
+                        # leave it untouched.
+                        return match.group(0)
+                    new_row_num = max(1, int(row_part) - rows_deleted)
+                    return f"{col_part}{dollar}{new_row_num}"
+
+                cell.value = cell_ref_pattern.sub(_shift_ref, value)
+
+    # Strip ALL background colors globally. The final output must have zero
+    # background fills (no blue "to-fill" marker, no yellow constant marker,
+    # no green) anywhere in the populated area of the sheet.
+    for row_idx in range(1, sheet.max_row + 1):
+        for col_idx in range(1, sheet.max_column + 1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            cell.fill = PatternFill(fill_type=None)
 
     output = BytesIO()
     workbook.save(output)
