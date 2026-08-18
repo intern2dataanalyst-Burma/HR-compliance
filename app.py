@@ -896,6 +896,146 @@ def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | N
     return None
 
 
+def _drop_ref_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop any hidden/intermediate 'ref' columns left over from pandas
+    calculations (e.g. 'Unit_Ref', 'ref', 'Code_ref') before a dataframe's
+    values are used to populate an exported form. Matches whole words only
+    ('ref'/'reference' as a standalone token or _-joined) so real fields
+    that merely contain the substring aren't accidentally dropped."""
+    ref_pattern = re.compile(r"^(ref|reference)$|(^|[_\s])(ref|reference)([_\s]|$)", re.IGNORECASE)
+    ref_cols = [c for c in df.columns if ref_pattern.search(str(c).strip())]
+    return df.drop(columns=ref_cols) if ref_cols else df
+
+
+def _is_numeric_or_formula_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str) and value.startswith("="):
+        return True
+    return False
+
+
+NON_SUMMABLE_HEADER_TOKENS = {
+    "signature", "account", "aadhar", "aadhaar", "pan", "uan", "regn",
+    "registration", "licence", "license", "mobile", "phone", "ward", "circle",
+    "number",
+}
+
+
+def _is_identifier_header(header_value: object) -> bool:
+    """True if a column header names an identifier (signature/account/Aadhar/
+    PAN/UAN/registration/mobile/ward-circle number) rather than a quantity.
+    Uses whole-word tokenization, not raw substring matching, so short
+    fragments can't false-positive inside unrelated words (e.g. a naive "no"
+    fragment would wrongly match inside "Normal earnings", and "id" would
+    wrongly match inside "Days Paid")."""
+    header_raw = str(header_value or "").lower()
+    tokens = set(re.findall(r"[a-z]+", header_raw))
+    return bool(tokens & NON_SUMMABLE_HEADER_TOKENS) or "a/c" in header_raw
+
+
+def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int, data_col_count: int) -> int:
+    """Append a Totals row directly below the last employee row. Sums every
+    column whose written values are numeric (or a live formula) across the
+    employee rows, using a real =SUM() formula so the sheet recalculates if
+    edited - never a hardcoded Python-computed number. Skips the Sr.No and
+    Code columns (always columns 1-2 in every form), and any other column
+    whose HEADER text marks it as an identifier rather than a quantity
+    (Signature, Account/A/C number, Aadhar, PAN, UAN, Regn./License number,
+    Mobile, Ward/Circle) - these can be stored as plain integers but summing
+    them produces a meaningless number, not a real total. Left deliberately
+    unstyled (no fill/background color) other than a bold "Total" label and
+    the borders already on the table, per spec - plain and uncolored."""
+    totals_row_idx = last_data_row + 1
+    label_written = False
+
+    for col_idx in range(1, data_col_count + 1):
+        col_letter = get_column_letter(col_idx)
+        target_cell = sheet.cell(row=totals_row_idx, column=col_idx)
+        source_cell = sheet.cell(row=last_data_row, column=col_idx)
+
+        # Match the table's grid (borders/alignment/font) but explicitly
+        # strip any fill - "no background colors" is a hard requirement.
+        copy_cell_style(source_cell, target_cell)
+        target_cell.fill = PatternFill(fill_type=None)
+        target_cell.value = None  # clear whatever leftover template content this row happens to carry
+
+        if col_idx <= 2:
+            continue
+
+        header_text = sheet.cell(row=header_row, column=col_idx).value
+        is_identifier_column = _is_identifier_header(header_text)
+
+        column_values = [
+            sheet.cell(row=r, column=col_idx).value for r in range(start_row, last_data_row + 1)
+        ]
+        populated_values = [v for v in column_values if v is not None and str(v).strip() != ""]
+
+        if (
+            not is_identifier_column
+            and populated_values
+            and all(_is_numeric_or_formula_value(v) for v in populated_values)
+        ):
+            target_cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{last_data_row})"
+            target_cell.font = Font(
+                name=source_cell.font.name, size=source_cell.font.size, bold=True
+            )
+        elif not label_written and populated_values:
+            # First text-bearing (or excluded identifier) column gets the
+            # "Total" label instead of a sum.
+            target_cell.value = "Total"
+            target_cell.font = Font(
+                name=source_cell.font.name, size=source_cell.font.size, bold=True
+            )
+            label_written = True
+
+    return totals_row_idx
+
+
+def apply_column_widths_and_number_formats(
+    sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int
+) -> None:
+    """Auto-size every column to its content (openpyxl has no native
+    auto-fit) and apply comma-separated numeric formatting to columns whose
+    values are numeric, so financial figures aren't cut off or left in raw
+    unformatted form."""
+    if last_content_row < header_row:
+        return
+
+    for col_idx in range(1, data_col_count + 1):
+        col_letter = get_column_letter(col_idx)
+        max_len = 0
+        has_decimal = False
+        is_numeric_column = True
+        any_value = False
+
+        for row_idx in range(header_row, last_content_row + 1):
+            value = sheet.cell(row=row_idx, column=col_idx).value
+            if value is None or str(value).strip() == "":
+                continue
+            any_value = True
+            text = str(value)
+            max_len = max(max_len, len(text))
+            if row_idx >= start_row:
+                if _is_numeric_or_formula_value(value):
+                    if isinstance(value, float) and not value.is_integer():
+                        has_decimal = True
+                else:
+                    is_numeric_column = False
+
+        if any_value:
+            sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 8), 40)
+
+        if any_value and is_numeric_column:
+            number_format = "#,##0.00" if has_decimal else "#,##0"
+            for row_idx in range(start_row, last_content_row + 1):
+                cell = sheet.cell(row=row_idx, column=col_idx)
+                if _is_numeric_or_formula_value(cell.value):
+                    cell.number_format = number_format
+
+
 def generate_dynamic_form(
     filtered_df: pd.DataFrame,
     template_source: io.BytesIO,
@@ -910,6 +1050,8 @@ def generate_dynamic_form(
     template_source.seek(0)
     workbook = load_workbook(template_source)
     sheet = workbook.active
+
+    filtered_df = _drop_ref_columns(filtered_df)
 
     write_header_month(sheet, selected_month, selected_year)
     if form_name:
@@ -1011,7 +1153,13 @@ def generate_dynamic_form(
             copy_cell_style(sheet.cell(row=start_row, column=month_col_idx), month_cell)
             safe_write(sheet, month_cell.coordinate, month_label)
 
-    for row_idx in range(start_row + row_count, table_end_row + 1):
+    totals_row_idx = start_row - 1
+    if row_count > 0:
+        last_data_row = start_row + row_count - 1
+        totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count)
+
+    clear_start_row = totals_row_idx + 1
+    for row_idx in range(clear_start_row, max(table_end_row, totals_row_idx) + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             safe_write(sheet, cell.coordinate, None)
@@ -1019,6 +1167,9 @@ def generate_dynamic_form(
             cell.border = Border()
             cell.font = Font()
             cell.alignment = Alignment()
+
+    last_content_row = totals_row_idx if row_count > 0 else start_row - 1
+    apply_column_widths_and_number_formats(sheet, header_row, start_row, last_content_row, data_col_count)
 
     output = BytesIO()
     workbook.save(output)
@@ -1345,14 +1496,13 @@ def list_archive_records() -> pd.DataFrame:
                 if not month_dir.is_dir():
                     continue
                 for archive_file in sorted(month_dir.glob("*.xlsx")):
-                    relative_link = f"{STATIC_WEB_PREFIX}/{state_dir.name}/{unit_dir.name}/{month_dir.name}/{archive_file.name}"
                     records.append(
                         {
                             "Form Name": archive_file.stem.replace(f"{state_dir.name}_{unit_dir.name}_", ""),
                             "State / Region": state_dir.name,
                             "Outlet / Brand Unit": unit_dir.name,
                             "Wage Month": month_dir.name,
-                            "OneDrive File Link": relative_link,
+                            "File Path": archive_file,
                         }
                     )
     return pd.DataFrame(records)
@@ -1597,20 +1747,31 @@ with tab2:
                                 "State / Region": selected_archive_state,
                                 "Outlet / Brand Unit": selected_archive_unit,
                                 "Wage Month": selected_archive_month,
-                                "OneDrive File Link": f"{STATIC_WEB_PREFIX}/{selected_archive_state}/{selected_archive_unit}/{selected_archive_month}/{archive_file.name}",
+                                "File Size (KB)": round(archive_file.stat().st_size / 1024, 1),
                             }
                             for archive_file in archived_files
                         ]
                     )
 
-                    st.dataframe(
-                        archive_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "OneDrive File Link": st.column_config.LinkColumn(
-                                "OneDrive File Link",
-                                display_text="📥 Open / Download Archived Form (.xlsx)",
+                    st.dataframe(archive_df, use_container_width=True, hide_index=True)
+
+                    st.markdown("#### Download Archived Forms")
+                    # Native st.download_button per file - reads bytes straight off
+                    # disk, so it works regardless of static-file-serving config.
+                    # The old "OneDrive File Link" column pointed at a local
+                    # container path (app/static/HR_Compliance_Archive/...) that
+                    # isn't reachable as a web URL, which is what caused the
+                    # File Not Found (404) error.
+                    for archive_file in archived_files:
+                        form_label = archive_file.stem.replace(f"{selected_archive_state}_{selected_archive_unit}_", "")
+                        dl_col1, dl_col2 = st.columns([3, 1])
+                        with dl_col1:
+                            st.write(f"📄 {form_label}")
+                        with dl_col2:
+                            st.download_button(
+                                label="📥 Download",
+                                data=archive_file.read_bytes(),
+                                file_name=archive_file.name,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"archive_dl_{selected_archive_state}_{selected_archive_unit}_{selected_archive_month}_{archive_file.name}",
                             )
-                        },
-                    )
