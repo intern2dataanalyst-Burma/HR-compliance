@@ -985,7 +985,14 @@ def apply_column_widths_and_number_formats(
     """Auto-size every column to its content (openpyxl has no native
     auto-fit) and apply comma-separated numeric formatting to columns whose
     values are numeric, so financial figures aren't cut off or left in raw
-    unformatted form."""
+    unformatted form. Also fixes the "text renders one letter per line, ###
+    on numeric cells" garbling seen in Form C: that happens when a data cell
+    inherits wrap_text=True from the template's source-row style (via
+    copy_cell_style) - a short value like "01-Apr-2026" doesn't need
+    wrapping, and wrapping it inside a too-short row squashes it into an
+    unreadable vertical stack. Data rows get wrap_text explicitly turned off
+    and a real row height; the header row's own wrap/rotation design (often
+    intentional for long compliance-register headers) is left untouched."""
     if last_content_row < header_row:
         return
 
@@ -1011,11 +1018,11 @@ def apply_column_widths_and_number_formats(
                     is_numeric_column = False
 
         if any_value:
-            # Strict minimum of 14 so date/time columns (e.g. "11:30:00 PM",
+            # Strict minimum of 15 so date/time columns (e.g. "11:30:00 PM",
             # "01-Jan-1999") never render as "#####" in Excel - a narrower
             # auto-fit width can fit the digit count but still be too small
             # for Excel's date/time column-width rendering rules.
-            sheet.column_dimensions[col_letter].width = max(max_len + 2, 14)
+            sheet.column_dimensions[col_letter].width = max(max_len + 2, 15)
 
         if any_value and is_numeric_column:
             number_format = "#,##0.00" if has_decimal else "#,##0"
@@ -1023,6 +1030,24 @@ def apply_column_widths_and_number_formats(
                 cell = sheet.cell(row=row_idx, column=col_idx)
                 if _is_numeric_or_formula_value(cell.value):
                     cell.number_format = number_format
+
+    # Data rows: force wrap_text off and give every row a real height, so a
+    # short value never fragments into a vertical letter-stack the way the
+    # Form C screenshot showed. The header row keeps whatever wrap/rotation
+    # the template's own design uses - only widen its row height so that
+    # design isn't clipped, never touch its wrap setting.
+    for row_idx in range(start_row, last_content_row + 1):
+        sheet.row_dimensions[row_idx].height = 18
+        for col_idx in range(1, data_col_count + 1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            if cell.alignment and cell.alignment.wrap_text:
+                new_alignment = copy(cell.alignment)
+                new_alignment.wrap_text = False
+                cell.alignment = new_alignment
+
+    header_row_height = sheet.row_dimensions[header_row].height
+    if not header_row_height or header_row_height < 30:
+        sheet.row_dimensions[header_row].height = 45
 
 
 def generate_dynamic_form(
