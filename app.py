@@ -525,8 +525,19 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
     match_idx = lookup[lookup == letter].index
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
+        # 1. Exact match - the common case.
         if col_name in row_data:
             return row_data.get(col_name, "")
+        # 2. Fuzzy match fallback: strip whitespace/newlines/underscores from
+        # both sides before comparing, so a Coloums entry like "Fixed
+        # Monthly Gross" still finds a real column that came through with
+        # hidden differences (e.g. a trailing newline or double space) that
+        # an exact-string match would miss.
+        clean_target = re.sub(r"[\s\n_]+", "", str(col_name)).lower()
+        for key, value in row_data.items():
+            clean_key = re.sub(r"[\s\n_]+", "", str(key)).lower()
+            if clean_key == clean_target:
+                return value
     return None
 
 
@@ -896,9 +907,48 @@ def _is_numeric_or_formula_value(value: object) -> bool:
         return False
     if isinstance(value, (int, float)):
         return True
-    if isinstance(value, str) and value.startswith("="):
-        return True
+    if isinstance(value, str):
+        if value.startswith("="):
+            return True
+        # Real-world Excel/pandas can surface a numeric column as text (e.g.
+        # pandas infers object dtype for a whole column because one row
+        # elsewhere in the sheet has a stray non-numeric entry) - a value
+        # like "33446" or "34,600" is still a real number and must be
+        # recognized as one, or formula-input columns get wrongly
+        # overwritten with 0 and totals/number-formatting skip it.
+        candidate = value.strip().replace(",", "")
+        if candidate:
+            try:
+                float(candidate)
+                return True
+            except ValueError:
+                return False
     return False
+
+
+def _coerce_numeric_value(value: object) -> object:
+    """Convert a numeric-looking string (e.g. "33446", "34,600") to a real
+    int/float. Classifying a value as numeric isn't enough on its own -
+    Excel treats literal text as 0 inside SUM()/arithmetic formulas, so a
+    string left unconverted would silently break totals and formulas the
+    same way writing "Nil" into a formula cell did."""
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str) and not value.startswith("="):
+        candidate = value.strip().replace(",", "")
+        if candidate:
+            # Don't touch a value with a meaningful leading zero (e.g. a
+            # phone number or PIN code like "0987654321") - converting that
+            # to a number would silently drop the leading zero and corrupt
+            # an identifier rather than fix a real amount.
+            if len(candidate) > 1 and candidate[0] == "0" and candidate[1] != ".":
+                return value
+            try:
+                as_float = float(candidate)
+                return int(as_float) if as_float.is_integer() else as_float
+            except ValueError:
+                pass
+    return value
 
 
 NON_SUMMABLE_HEADER_TOKENS = {
@@ -1200,6 +1250,15 @@ def generate_dynamic_form(
                 # intentional, correct value like "Nil" - would turn the
                 # formula's result into #VALUE!, so it must be a real 0.
                 cell_value = 0
+            else:
+                # Convert any numeric-looking string ("33446", "34,600") to
+                # a real int/float. This matters everywhere, not just
+                # formula-input columns: a numeric value left as text still
+                # reads as 0 inside Excel's SUM()/arithmetic, and won't
+                # right-align or take on the comma number-format applied
+                # later - the same failure mode as writing "Nil" into a
+                # formula cell, just silent instead of showing #VALUE!.
+                cell_value = _coerce_numeric_value(cell_value)
 
             safe_write(sheet, f"{get_column_letter(col_idx)}{row_idx}", cell_value)
 
