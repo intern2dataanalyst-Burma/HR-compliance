@@ -417,6 +417,7 @@ def build_merged_view() -> pd.DataFrame:
 
     return df
 
+
 def normalize_header(value: object) -> str:
     if value is None:
         return ""
@@ -525,19 +526,8 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
     match_idx = lookup[lookup == letter].index
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
-        # 1. Exact match - the common case.
         if col_name in row_data:
             return row_data.get(col_name, "")
-        # 2. Fuzzy match fallback: strip whitespace/newlines/underscores from
-        # both sides before comparing, so a Coloums entry like "Fixed
-        # Monthly Gross" still finds a real column that came through with
-        # hidden differences (e.g. a trailing newline or double space) that
-        # an exact-string match would miss.
-        clean_target = re.sub(r"[\s\n_]+", "", str(col_name)).lower()
-        for key, value in row_data.items():
-            clean_key = re.sub(r"[\s\n_]+", "", str(key)).lower()
-            if clean_key == clean_target:
-                return value
     return None
 
 
@@ -627,15 +617,12 @@ def resolve_col_rule(
         for part in rule_text.split("+"):
             letter = _extract_col_letter(part)
             value = _lookup_col_ref_value(letter, df_col_ref, row_data)
-            if value is None or value == "" or pd.isna(value):
-                # Missing/blank source cell for this employee - skip it
-                # rather than letting a NaN silently poison the whole sum.
-                continue
-            try:
-                total += float(value)
-                any_value = True
-            except (TypeError, ValueError):
-                pass
+            if value not in (None, ""):
+                try:
+                    total += float(value)
+                    any_value = True
+                except (TypeError, ValueError):
+                    pass
         return total if any_value else ""
 
     if _is_col_prefixed(rule_text):
@@ -750,6 +737,17 @@ def safe_write(sheet, cell_coordinate: str, value) -> None:
 TEMPLATE_MARKER_FILLS = {"FFBDD6EE", "FFFFFF00", "FF9CC2E5"}
 
 
+def is_reference_cell(cell) -> bool:
+    """True for cells filled with the template's yellow 'reference/constant'
+    color - these hold values that are the same for every employee (shift
+    timings, 'Monthly', 'Approved in HRMS', etc.) or are intentionally
+    manual/exception-only fields, and must never be blanked out."""
+    fill = cell.fill
+    if fill and fill.fgColor and fill.fgColor.type == "rgb":
+        return fill.fgColor.rgb == "FFFFFF00"
+    return False
+
+
 def detect_table_end_row(sheet, start_row: int, max_scan: int = 500) -> int:
     """Find the real last pre-formatted employee row by scanning downward
     from start_row for the template's marker fill colors (blue 'to-fill'
@@ -852,9 +850,6 @@ def verify_generated_form(
         return [f"Unable to open generated workbook for QA: {exc}"]
 
     form_key = str(form_name).strip().upper() if form_name else ""
-    # These match FORM_START_ROWS in generate_dynamic_form exactly - the
-    # reference row is now cleared + hidden in place rather than deleted,
-    # so no row indices shift and these stay at their original positions.
     start_row = {"FORM A": 19, "FORM C": 9, "FORM D": 8, "FORM E": 9, "FORM IV": 10, "FORM V": 11}.get(form_key, 9)
     known_codes = known_codes or set()
 
@@ -902,147 +897,15 @@ def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | N
     return None
 
 
-def _is_numeric_or_formula_value(value: object) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, (int, float)):
-        return True
-    if isinstance(value, str):
-        if value.startswith("="):
-            return True
-        # Real-world Excel/pandas can surface a numeric column as text (e.g.
-        # pandas infers object dtype for a whole column because one row
-        # elsewhere in the sheet has a stray non-numeric entry) - a value
-        # like "33446" or "34,600" is still a real number and must be
-        # recognized as one, or formula-input columns get wrongly
-        # overwritten with 0 and totals/number-formatting skip it.
-        candidate = value.strip().replace(",", "")
-        if candidate:
-            try:
-                float(candidate)
-                return True
-            except ValueError:
-                return False
-    return False
-
-
-def _coerce_numeric_value(value: object) -> object:
-    """Convert a numeric-looking string (e.g. "33446", "34,600") to a real
-    int/float. Classifying a value as numeric isn't enough on its own -
-    Excel treats literal text as 0 inside SUM()/arithmetic formulas, so a
-    string left unconverted would silently break totals and formulas the
-    same way writing "Nil" into a formula cell did."""
-    if isinstance(value, bool) or isinstance(value, (int, float)):
-        return value
-    if isinstance(value, str) and not value.startswith("="):
-        candidate = value.strip().replace(",", "")
-        if candidate:
-            # Don't touch a value with a meaningful leading zero (e.g. a
-            # phone number or PIN code like "0987654321") - converting that
-            # to a number would silently drop the leading zero and corrupt
-            # an identifier rather than fix a real amount.
-            if len(candidate) > 1 and candidate[0] == "0" and candidate[1] != ".":
-                return value
-            try:
-                as_float = float(candidate)
-                return int(as_float) if as_float.is_integer() else as_float
-            except ValueError:
-                pass
-    return value
-
-
-NON_SUMMABLE_HEADER_TOKENS = {
-    "signature", "account", "aadhar", "aadhaar", "pan", "uan", "regn",
-    "registration", "licence", "license", "mobile", "phone", "ward", "circle",
-    "number",
-}
-
-
-def _is_identifier_header(header_value: object) -> bool:
-    """True if a column header names an identifier (signature/account/Aadhar/
-    PAN/UAN/registration/mobile/ward-circle number) rather than a quantity.
-    Uses whole-word tokenization, not raw substring matching, so short
-    fragments can't false-positive inside unrelated words (e.g. a naive "no"
-    fragment would wrongly match inside "Normal earnings", and "id" would
-    wrongly match inside "Days Paid")."""
-    header_raw = str(header_value or "").lower()
-    tokens = set(re.findall(r"[a-z]+", header_raw))
-    return bool(tokens & NON_SUMMABLE_HEADER_TOKENS) or "a/c" in header_raw
-
-
-def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int, data_col_count: int) -> int:
-    """Append a Totals row directly below the last employee row. Sums every
-    column whose written values are numeric (or a live formula) across the
-    employee rows, using a real =SUM() formula so the sheet recalculates if
-    edited - never a hardcoded Python-computed number. Skips the Sr.No and
-    Code columns (always columns 1-2 in every form), and any other column
-    whose HEADER text marks it as an identifier rather than a quantity
-    (Signature, Account/A/C number, Aadhar, PAN, UAN, Regn./License number,
-    Mobile, Ward/Circle) - these can be stored as plain integers but summing
-    them produces a meaningless number, not a real total. Left deliberately
-    unstyled (no fill/background color) other than a bold "Total" label and
-    the borders already on the table, per spec - plain and uncolored."""
-    totals_row_idx = last_data_row + 1
-    label_written = False
-
-    for col_idx in range(1, data_col_count + 1):
-        col_letter = get_column_letter(col_idx)
-        target_cell = sheet.cell(row=totals_row_idx, column=col_idx)
-        source_cell = sheet.cell(row=last_data_row, column=col_idx)
-
-        # Match the table's grid (borders/alignment/font) but explicitly
-        # strip any fill - "no background colors" is a hard requirement.
-        copy_cell_style(source_cell, target_cell)
-        target_cell.fill = PatternFill(fill_type=None)
-        target_cell.value = None  # clear whatever leftover template content this row happens to carry
-
-        if col_idx <= 2:
-            continue
-
-        header_text = sheet.cell(row=header_row, column=col_idx).value
-        is_identifier_column = _is_identifier_header(header_text)
-
-        column_values = [
-            sheet.cell(row=r, column=col_idx).value for r in range(start_row, last_data_row + 1)
-        ]
-        populated_values = [v for v in column_values if v is not None and str(v).strip() != ""]
-
-        if (
-            not is_identifier_column
-            and populated_values
-            and all(_is_numeric_or_formula_value(v) for v in populated_values)
-        ):
-            target_cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{last_data_row})"
-            target_cell.font = Font(
-                name=source_cell.font.name, size=source_cell.font.size, bold=True
-            )
-        elif not label_written and populated_values:
-            # First text-bearing (or excluded identifier) column gets the
-            # "Total" label instead of a sum.
-            target_cell.value = "Total"
-            target_cell.font = Font(
-                name=source_cell.font.name, size=source_cell.font.size, bold=True
-            )
-            label_written = True
-
-    return totals_row_idx
-
-
-def apply_column_widths_and_number_formats(
-    sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int
-) -> None:
-    """Auto-size every column to its content (openpyxl has no native
-    auto-fit) and apply comma-separated numeric formatting to columns whose
-    values are numeric, so financial figures aren't cut off or left in raw
-    unformatted form."""
+def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int) -> None:
+    """Auto-size every column to its content with a strict minimum of 18
+    so date/time strings never squash into ### hashes in Excel."""
     if last_content_row < header_row:
         return
 
     for col_idx in range(1, data_col_count + 1):
         col_letter = get_column_letter(col_idx)
         max_len = 0
-        has_decimal = False
-        is_numeric_column = True
         any_value = False
 
         header_cell = sheet.cell(row=header_row, column=col_idx)
@@ -1054,37 +917,12 @@ def apply_column_widths_and_number_formats(
                 continue
             any_value = True
             if row_idx == header_row and header_wraps:
-                # The template marked this header wrap_text=True by design
-                # (e.g. "Whether employed on daily, monthly, contract or
-                # piece-rate wages, with rate" is meant to wrap onto several
-                # lines in a normal-width column) - basing the column width
-                # on its full unwrapped length instead of the data it holds
-                # was stretching some columns to 70+ characters wide.
                 continue
             text = str(value)
             max_len = max(max_len, len(text))
-            if row_idx >= start_row:
-                if _is_numeric_or_formula_value(value):
-                    if isinstance(value, float) and not value.is_integer():
-                        has_decimal = True
-                else:
-                    is_numeric_column = False
 
         if any_value:
-            # Strict minimum of 18 so date/time columns (e.g. "11:30:00 PM",
-            # "01-Jan-1999") never render as "#####" in Excel - a narrower
-            # auto-fit width can fit the digit count but still be too small
-            # for Excel's date/time column-width rendering rules. Capped at
-            # 45 so a long, non-wrapping header still can't stretch one
-            # column across half the sheet.
             sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 18), 45)
-
-        if any_value and is_numeric_column:
-            number_format = "#,##0.00" if has_decimal else "#,##0"
-            for row_idx in range(start_row, last_content_row + 1):
-                cell = sheet.cell(row=row_idx, column=col_idx)
-                if _is_numeric_or_formula_value(cell.value):
-                    cell.number_format = number_format
 
 
 def generate_dynamic_form(
@@ -1102,14 +940,6 @@ def generate_dynamic_form(
     workbook = load_workbook(template_source)
     sheet = workbook.active
 
-    # selected_month may arrive as a full "Month-Year" string (e.g.
-    # "April-2026") since that's what the dashboard's Month-Year dropdown
-    # actually holds - every date-injection helper below expects a bare
-    # month name and appends "-{selected_year}" itself, so this must be
-    # normalized FIRST, before write_header_month/inject_form_dates run,
-    # not partway through the function.
-    selected_month = selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July"
-
     write_header_month(sheet, selected_month, selected_year)
     if form_name:
         inject_form_dates(sheet, form_name, selected_month, selected_year)
@@ -1117,8 +947,6 @@ def generate_dynamic_form(
     header_row = find_header_row(sheet)
     header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 51)]
 
-    # Verified directly against the real template files: the first row below the
-    # header/source-annotation block where blue "to-fill" cells begin.
     FORM_START_ROWS = {
         "FORM A": 19,
         "FORM C": 9,
@@ -1139,31 +967,15 @@ def generate_dynamic_form(
             f"extend the template's formatted rows to include everyone."
         )
 
-    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
+    active_month = selected_month if selected_month not in {"All", "", None} else "July"
     month_label = f"{active_month[:3]}-{str(selected_year)[-2:]}"
     wage_month_columns = {"Form E": "E", "Form D": "F"}
     unit_master_details = get_unit_master_details(df_units, selected_unit)
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name)
 
     data_col_count = min(sheet.max_column, 51)
-
-    # Some templates (Form IV's "Total earning" = "=N{row}+M{row}") have a
-    # live per-row formula. Any column that formula references must always
-    # end up holding a real number - even when the master's own Sheet1 rule
-    # is an intentional literal like "Nil (Fixed Text)" (a legitimate,
-    # correct value to DISPLAY, but not one Excel can add to a number).
-    # Detect this generically by scanning the template's first data row for
-    # formula cells and parsing which columns they reference, rather than
-    # hardcoding "Form IV column N" - this then applies to any current or
-    # future template with the same pattern.
-    formula_input_columns: set[int] = set()
-    cell_ref_scan_pattern = re.compile(r"\$?([A-Za-z]{1,3})\$?(\d+)")
-    for col_idx in range(1, data_col_count + 1):
-        probe_value = sheet.cell(row=start_row, column=col_idx).value
-        if isinstance(probe_value, str) and probe_value.startswith("="):
-            for ref_col_letters, _ in cell_ref_scan_pattern.findall(probe_value):
-                formula_input_columns.add(column_letter_to_index(ref_col_letters))
-
+    
+    # Exact Baseline Data Logic Restoration from app (2)-old.py
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
         row_idx = start_row + offset
@@ -1172,16 +984,11 @@ def generate_dynamic_form(
             source_cell = sheet.cell(row=start_row, column=col_idx)
             copy_cell_style(source_cell, target_cell)
 
-            # Preserve the template's original constant for this column
-            # (e.g. shift timing "11:30 AM", "Monthly", "N.A.", "NIL") so
-            # it's available as a fallback if the employee's computed value
-            # turns out to be empty. We no longer skip yellow cells outright
-            # - every cell must be evaluated against the employee's data.
-            template_constant = source_cell.value
+            # Restored MANDATORY `is_reference_cell` skip logic to preserve "NIL" and "0" constants
+            if is_reference_cell(source_cell):
+                continue
 
-            # Some templates (Form IV's "Total earning" column) have a live
-            # per-row formula already built in - never overwrite a formula
-            # with a computed data value.
+            # Preserve live formulas
             if isinstance(target_cell.value, str) and target_cell.value.startswith("="):
                 continue
 
@@ -1194,7 +1001,6 @@ def generate_dynamic_form(
                         rule_value = str(candidate).strip()
 
             if rule_value:
-                # An explicit Sheet1 rule exists for this column - use it.
                 cell_value = resolve_col_rule(
                     rule_value,
                     df_col_ref,
@@ -1206,9 +1012,6 @@ def generate_dynamic_form(
                     selected_unit=selected_unit,
                 )
             else:
-                # No Sheet1 rule: fall back to matching the column's header
-                # text (e.g. "Code", "Father's/Husband's Name") against the
-                # employee's actual data - NOT writing the header text itself.
                 header_value = header_cells[col_idx - 1] if col_idx <= len(header_cells) else None
                 cell_value = get_value_for_header(
                     header_value,
@@ -1220,46 +1023,6 @@ def generate_dynamic_form(
                     df_units=df_units,
                     selected_unit=selected_unit,
                 )
-
-            # Fallback: only when the computed value for THIS employee is
-            # empty/blank do we keep the template's original constant
-            # (e.g. "N.A.", "NIL", "11:30 AM") instead of writing a blank.
-            # A source field that exists but is genuinely unpopulated for
-            # this employee/unit comes back from pandas as NaN/NaT (a float
-            # or pandas-null, not None or "") - pd.isna() catches those too,
-            # which a plain "is None" check was missing. This was the actual
-            # cause of Form E's "Percentage%" column (and any other column
-            # sourced from a blank Conso_Data cell) showing up empty instead
-            # of falling back to the template's constant.
-            is_blank_result = (
-                cell_value is None
-                or (isinstance(cell_value, str) and cell_value.strip() == "")
-                or (not isinstance(cell_value, (list, dict)) and pd.isna(cell_value))
-            )
-            if is_blank_result and template_constant is not None and str(template_constant).strip() != "":
-                cell_value = template_constant
-            elif is_blank_result:
-                # No usable template constant either - write a real empty
-                # string rather than a stray NaN/NaT making it into the cell.
-                cell_value = ""
-
-            if col_idx in formula_input_columns and not _is_numeric_or_formula_value(cell_value):
-                # This column feeds a live formula elsewhere in the row
-                # (e.g. Form IV's Total earning = Normal + Over-time
-                # earning). A non-numeric result here - even an
-                # intentional, correct value like "Nil" - would turn the
-                # formula's result into #VALUE!, so it must be a real 0.
-                cell_value = 0
-            else:
-                # Convert any numeric-looking string ("33446", "34,600") to
-                # a real int/float. This matters everywhere, not just
-                # formula-input columns: a numeric value left as text still
-                # reads as 0 inside Excel's SUM()/arithmetic, and won't
-                # right-align or take on the comma number-format applied
-                # later - the same failure mode as writing "Nil" into a
-                # formula cell, just silent instead of showing #VALUE!.
-                cell_value = _coerce_numeric_value(cell_value)
-
             safe_write(sheet, f"{get_column_letter(col_idx)}{row_idx}", cell_value)
 
         if form_name in wage_month_columns:
@@ -1269,13 +1032,8 @@ def generate_dynamic_form(
             copy_cell_style(sheet.cell(row=start_row, column=month_col_idx), month_cell)
             safe_write(sheet, month_cell.coordinate, month_label)
 
-    totals_row_idx = start_row - 1
-    if row_count > 0:
-        last_data_row = start_row + row_count - 1
-        totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count)
-
-    clear_start_row = totals_row_idx + 1
-    for row_idx in range(clear_start_row, max(table_end_row, totals_row_idx) + 1):
+    # Clear remaining unused template rows
+    for row_idx in range(start_row + row_count, table_end_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             safe_write(sheet, cell.coordinate, None)
@@ -1284,35 +1042,18 @@ def generate_dynamic_form(
             cell.font = Font()
             cell.alignment = Alignment()
 
-    # Hide the template's leftover "reference row" (e.g. "Sal Reg",
-    # "Emp Mast", "Unit Mast", "Attd Reg" source-annotation labels) that
-    # sits directly above the employee data at start_row - 1, instead of
-    # deleting it. Clearing values + hiding achieves the same visible
-    # result (the row is gone from view) without shifting any row indices
-    # or touching formula text at all - simpler and more robust than
-    # physically deleting the row, which would require rewriting every
-    # per-row formula's cell references (e.g. Form IV's "=N10+M10") to
-    # still point at their own row after the shift.
+    # Visual Fix 1: Safely Hide Reference Row
     reference_row_idx = start_row - 1
     if reference_row_idx >= 1:
         for col_idx in range(1, sheet.max_column + 1):
             sheet.cell(row=reference_row_idx, column=col_idx).value = None
         sheet.row_dimensions[reference_row_idx].hidden = True
 
-    last_content_row = totals_row_idx if row_count > 0 else start_row - 1
-    apply_column_widths_and_number_formats(sheet, header_row, start_row, last_content_row, data_col_count)
+    # Visual Fix 2: Apply Column Widths (Min width 18 to fix Form C ### issues)
+    last_content_row = (start_row + row_count - 1) if row_count > 0 else start_row
+    apply_column_widths(sheet, header_row, start_row, last_content_row, data_col_count)
 
-    # Strip ALL background colors AND text rotation globally. The final
-    # output must have zero background fills (no blue "to-fill" marker, no
-    # yellow constant marker, no green) anywhere in the populated area of
-    # the sheet. Text rotation is also stripped: verified directly against
-    # the raw source templates that several columns (e.g. Form C's Opening
-    # Balance through Employee signature block) have text_rotation=90 baked
-    # into both the header row AND the pre-formatted data rows by the
-    # template's original author - this is what rendered headers as
-    # illegible vertically-stacked single characters, and combined with
-    # column auto-width (which assumes horizontal text) is what produced
-    # the "#####" display artifacts.
+    # Visual Fix 3: Strip Background Colors & Reset Text Rotation globally (Crucial for Form C)
     for row_idx in range(1, sheet.max_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
@@ -1542,7 +1283,7 @@ def save_form_to_archive(
     selected_year: int,
     form_name: str,
 ) -> tuple[Path, Path]:
-    active_month = (selected_month.split("-")[0] if selected_month != "All" else "July")  # selected_month may be a full Month-Year string
+    active_month = selected_month if selected_month != "All" else "July"
     active_month_year = f"{active_month}-{selected_year}"
 
     target_static_dir = STATIC_ARCHIVE_DIR / str(selected_state) / str(selected_unit) / active_month_year
@@ -1576,7 +1317,7 @@ def compile_statutory_forms(
         errors.append(f"No template URLs configured for {selected_state}")
         return generated, errors, archive_target_dir
 
-    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
+    active_month = selected_month if selected_month not in {"All", "", None} else "July"
 
     for form_name in form_names:
         if form_name not in state_urls:
@@ -1763,7 +1504,7 @@ with tab1:
                         int(selected_year),
                     )
                     status.write(f"☁️ Auto-pushed to OneDrive folder: `{archive_dir}`")
-                    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
+                    active_month = selected_month if selected_month not in {"All", "", None} else "July"
                     active_month_year = f"{active_month}-{selected_year}"
                     filename = f"{selected_state}_{selected_unit}_{selected_form}_{active_month_year}.xlsx"
                     if selected_form in generated:
@@ -1776,7 +1517,7 @@ with tab1:
                         else:
                             status.caption(f"⚠️ {email_msg}")
                     status.update(label="✅ Form generated and synced to OneDrive successfully!", state="complete")
-                active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
+                active_month = selected_month if selected_month not in {"All", "", None} else "July"
                 active_month_year = f"{active_month}-{selected_year}"
                 if errors:
                     for error in errors:
@@ -1809,7 +1550,7 @@ with tab1:
                         int(selected_year),
                     )
                     status.write(f"☁️ Auto-pushed to OneDrive folder: `{archive_dir}`")
-                    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
+                    active_month = selected_month if selected_month not in {"All", "", None} else "July"
                     active_month_year = f"{active_month}-{selected_year}"
                     if generated:
                         zip_buffer = io.BytesIO()
@@ -1828,7 +1569,7 @@ with tab1:
                         else:
                             status.caption(f"⚠️ {email_msg}")
                     status.update(label="✅ All forms generated and synced to OneDrive successfully!", state="complete")
-                active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
+                active_month = selected_month if selected_month not in {"All", "", None} else "July"
                 active_month_year = f"{active_month}-{selected_year}"
                 if errors:
                     for error in errors:
@@ -1910,12 +1651,6 @@ with tab2:
                     st.dataframe(archive_df, use_container_width=True, hide_index=True)
 
                     st.markdown("#### Download Archived Forms")
-                    # Native st.download_button per file - reads bytes straight off
-                    # disk, so it works regardless of static-file-serving config.
-                    # The old "OneDrive File Link" column pointed at a local
-                    # container path (app/static/HR_Compliance_Archive/...) that
-                    # isn't reachable as a web URL, which is what caused the
-                    # File Not Found (404) error.
                     for archive_file in archived_files:
                         form_label = archive_file.stem.replace(f"{selected_archive_state}_{selected_archive_unit}_", "")
                         dl_col1, dl_col2 = st.columns([3, 1])
