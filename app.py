@@ -63,7 +63,6 @@ DATA_CANDIDATES = [
 TEMPLATES_DIR = BASE_DIR / "templates"
 
 # Constants for master file sync
-# Use lowercase .xlsx so pd.ExcelWriter accepts the extension
 MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.xlsx"
 ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
 
@@ -98,34 +97,21 @@ if ONEDRIVE_ARCHIVE_DIR:
 
 @st.cache_data(ttl=3600)
 def get_active_master_data():
-    """
-    Ensure a local copy of the master file exists (download from OneDrive if missing)
-    and return it as a pandas DataFrame. Cached for 1 hour.
-    """
     if not os.path.exists(MASTER_FILE_PATH):
         try:
             os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
             response = requests.get(ONEDRIVE_MASTER_URL, timeout=30, allow_redirects=True)
             response.raise_for_status()
-
-            # Guard against HTML redirect pages being returned instead of an Excel file
             head = response.content[:200].lower()
             if b"<html" in head or b"<!doctype html" in head:
                 st.error("❌ OneDrive URL returned a webpage instead of an Excel file. Please check share link permissions.")
                 st.stop()
-
             with open(MASTER_FILE_PATH, "wb") as f:
                 f.write(response.content)
         except Exception as e:
             st.error(f"❌ Failed to fetch Master Data from OneDrive: {e}")
             st.stop()
     try:
-        # skiprows=1 is REQUIRED: row 1 of Conso_Data is a spreadsheet
-        # column-letter reference row ("A", "B", "C"...), not real headers -
-        # real field names are on row 2. Without this, every column name
-        # comes out as a letter, which made the upload's "missing columns"
-        # check compare against garbage and fail on every single upload.
-        # This must match load_master_data()'s reading of the same sheet.
         df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
         df.columns = df.columns.astype(str).str.strip()
         if "Month-Year" in df.columns:
@@ -137,10 +123,6 @@ def get_active_master_data():
 
 
 def email_file_to_outlook(file_bytes, filename):
-    """
-    Emails the generated file to Outlook with a structured subject tag 
-    so Power Automate can automatically ingest it into OneDrive.
-    """
     try:
         if hasattr(file_bytes, "getvalue"):
             file_bytes = file_bytes.getvalue()
@@ -165,17 +147,9 @@ def email_file_to_outlook(file_bytes, filename):
         if filename.lower().endswith(".zip"):
             maintype, subtype = "application", "zip"
         else:
-            maintype, subtype = (
-                "application",
-                "vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            maintype, subtype = ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        msg.add_attachment(
-            file_bytes,
-            maintype=maintype,
-            subtype=subtype,
-            filename=filename,
-        )
+        msg.add_attachment(file_bytes, maintype=maintype, subtype=subtype, filename=filename)
 
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as smtp:
             smtp.ehlo()
@@ -190,15 +164,6 @@ def email_file_to_outlook(file_bytes, filename):
 
 
 def write_conso_data_sheet(master_path: str, new_df: pd.DataFrame) -> None:
-    """Overwrite ONLY the Conso_Data sheet in the multi-sheet master
-    workbook, preserving every other sheet (Units_Master, Coloums, Sheet1)
-    completely untouched. Reproduces the sheet's exact original layout -
-    row 1 = spreadsheet column-letter labels (A, B, C...), row 2 = real
-    field headers, row 3+ = data - because the rest of the pipeline
-    (load_master_data, get_active_master_data) relies on skiprows=1 to
-    find the real header row. Using pandas' plain to_excel() here would
-    write headers at row 1 instead, silently shifting every column by one
-    row on the very next read after an upload."""
     workbook = load_workbook(master_path)
     if "Conso_Data" in workbook.sheetnames:
         sheet_index = workbook.sheetnames.index("Conso_Data")
@@ -217,26 +182,18 @@ def write_conso_data_sheet(master_path: str, new_df: pd.DataFrame) -> None:
             if pd.isna(value):
                 value = None
             elif hasattr(value, "isoformat"):
-                pass  # keep real datetime/date objects as-is for correct Excel formatting
+                pass
             sheet.cell(row=row_offset, column=col_idx, value=value)
 
     workbook.save(master_path)
 
 
 def normalize_unit_key(value: object) -> str:
-    """Normalize a unit name for matching between Conso_Data and
-    Units_Master. Verified against the real master file: the two sheets
-    spell many unit names differently ('Mumbai Fort' vs 'Mumbai-Fort',
-    'Gurugram Worldmark 65' vs 'Gurugram Worldmark65') - stripping all
-    hyphens/underscores/whitespace, not just case, resolves those without
-    needing the spreadsheet's unit names to be rewritten."""
     return re.sub(r"[\s\-_]+", "", str(value)).strip().lower()
 
 
 def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     try:
-        # Prefer a locally cached master file if present (keeps app responsive
-        # to uploads). Otherwise fall back to the configured secret URL.
         if Path(MASTER_FILE_PATH).exists():
             with open(MASTER_FILE_PATH, "rb") as f:
                 file_bytes = io.BytesIO(f.read())
@@ -248,19 +205,11 @@ def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             response.raise_for_status()
             file_bytes = io.BytesIO(response.content)
 
-        # Load data sheets (skipping row 1 because headers start on row 2)
         df_conso = pd.read_excel(file_bytes, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
         df_units = pd.read_excel(file_bytes, sheet_name="Units_Master", skiprows=1, engine="openpyxl")
-
-        # Load mapping rule sheets directly from the same spreadsheet
         df_mapping_rules = pd.read_excel(file_bytes, sheet_name="Sheet1", header=None, engine="openpyxl")
         df_col_ref = pd.read_excel(file_bytes, sheet_name="Coloums", skiprows=3, engine="openpyxl")
 
-        # The templates reference three more source registers ("Emp Mast",
-        # "Leave Reg", "Attd Reg") that don't exist in the master workbook
-        # yet. Load them if/when they're added, without crashing if absent -
-        # Form C's leave columns and Form V's attendance grid will start
-        # filling automatically as soon as these sheets appear.
         def _try_load_optional_sheet(candidate_names: list[str]) -> pd.DataFrame:
             for candidate in candidate_names:
                 try:
@@ -314,8 +263,6 @@ def build_merged_view() -> pd.DataFrame:
     df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register = load_master_data()
     df = df_conso.copy()
 
-    # Fill in Father/Spouse Name, Sex, DOB etc. from the Employee Master when
-    # Conso_Data doesn't carry them and Emp Mast has since been added.
     if not df_emp_master.empty and "Unit" in df.columns:
         code_col = next((c for c in df_emp_master.columns if "code" in c.lower()), None)
         conso_code_col = next((c for c in df.columns if "code" in c.lower()), None)
@@ -353,13 +300,6 @@ def build_merged_view() -> pd.DataFrame:
         "Total Deductions": ["Total Deductions", "Total_Deductions", "Deduction", "Total Deduction"],
         "Net Paid": ["Net Paid", "Net_Paid", "Net Salary"],
     }
-
-    # NOTE: Sheet1 is NOT a generic [target_name, alias1, alias2...] alias
-    # table - it's the form-generation rule sheet (verified against the real
-    # master file), with each row being either a form's header labels or its
-    # rule values. Treating its rows as dashboard column aliases previously
-    # corrupted "Unit" (and could corrupt any other real column whose name
-    # happened to match a word in a form's header row, e.g. "Code").
 
     for canonical_name, aliases in canonical_columns.items():
         matched_column = next((alias for alias in aliases if alias in df.columns), None)
@@ -401,16 +341,12 @@ def build_merged_view() -> pd.DataFrame:
             break
 
     if "Unit_Clean" in df.columns and "Unit_Clean" in df_units.columns:
-        # Use third column from Units_Master (contains unit names like "Ahemedabad", "Mumbai-Borivali")
         unit_name_col = df_units.columns[2] if len(df_units.columns) > 2 else "Unit"
-        
-        # Build lookup dictionary: Unit_Clean -> Unit Name
         if unit_name_col in df_units.columns and unit_name_col != "Unit_Clean":
             try:
                 unit_lookup = df_units[["Unit_Clean", unit_name_col]].drop_duplicates(subset=["Unit_Clean"])
                 unit_dict = dict(zip(unit_lookup["Unit_Clean"].astype(str).str.strip(), 
                                     unit_lookup[unit_name_col].astype(str).str.strip()))
-                # Apply the lookup to Unit_Display
                 df["Unit_Display"] = df["Unit_Clean"].map(unit_dict).fillna(df["Unit_Raw"].astype(str).str.strip())
             except Exception as e:
                 st.warning(f"Unit name lookup issue: {e}")
@@ -429,12 +365,6 @@ HEADER_KEYWORDS = ["employee", "code", "name", "father", "spouse", "designation"
 
 
 def find_header_row(sheet) -> int:
-    # A real header row has several SEPARATE short cells, each naming a
-    # column (Code, Name, Father...). A title/preamble sentence lives in a
-    # single merged cell and can accidentally contain one keyword substring
-    # (e.g. "REGISTER OF WAGES OF EMPLOYEES" contains "employee"). Counting
-    # distinct matching cells - not raw keyword occurrences - tells them
-    # apart: require at least 2 separate header-bearing cells in the row.
     best_row = 10
     best_score = 0
     for row_idx in range(1, 26):
@@ -491,10 +421,6 @@ def get_unit_master_details(df_units: pd.DataFrame | None, selected_unit: str | 
 
 
 def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: str | None, column_letter: str) -> object:
-    """Look up a Units_Master column by its real Excel letter (e.g. 'F' for
-    Timing-From, 'M' for Ward/Circle) for the selected unit's row. Positional
-    (letter) lookup is used instead of column names because Units_Master has
-    duplicate header text ('From'/'To' appear twice, for Timing and Rest)."""
     if df_units is None or df_units.empty or not selected_unit or not column_letter:
         return ""
     df_units = df_units.copy()
@@ -514,7 +440,7 @@ def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: s
 
 def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
     """Look up a Coloums letter (e.g. 'B', 'EN') and return that field's
-    value from the employee row dict."""
+    value from the employee row dict, falling back to a fuzzy match if hidden whitespace exists."""
     if not letter or df_col_ref is None or df_col_ref.empty:
         return None
     df_col_ref = df_col_ref.copy()
@@ -526,22 +452,24 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
     match_idx = lookup[lookup == letter].index
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
+        # 1. Exact match
         if col_name in row_data:
             return row_data.get(col_name, "")
+        # 2. Fuzzy match fallback
+        clean_target = re.sub(r"[\s\n_]+", "", str(col_name)).lower()
+        for key, value in row_data.items():
+            clean_key = re.sub(r"[\s\n_]+", "", str(key)).lower()
+            if clean_key == clean_target:
+                return value
     return None
 
 
 COL_PREFIX_RE = re.compile(r"^col[\s\-_]+", re.IGNORECASE)
 
-
 def _is_col_prefixed(rule_text: str) -> bool:
     return bool(COL_PREFIX_RE.match(rule_text.strip()))
 
-
 def _extract_col_letter(token: str) -> str:
-    """Pull the trailing Excel column letters out of a rule token - handles
-    'Col_EN', 'Col-B', 'Col AO' (space-separated), and a bare 'EP' used on
-    the right side of a '+' or with no prefix at all."""
     token = token.strip()
     token = COL_PREFIX_RE.sub("", token)
     return "".join(ch for ch in token if ch.isalpha()).upper()
@@ -567,8 +495,6 @@ def resolve_col_rule(
     lowered_rule = rule_text.lower()
 
     if "fixed text" in lowered_rule:
-        # Handles every real variant seen in the master sheet: "(Fixed Text)",
-        # "( Fixed Text)" (extra space), and "- Fixed Text" (no parens at all).
         cleaned = re.sub(r"[\(\-]?\s*fixed\s*text\s*\)?", "", rule_text, flags=re.IGNORECASE)
         return cleaned.strip(" -")
 
@@ -596,8 +522,6 @@ def resolve_col_rule(
         return days_in_month
 
     if "unit master" in lowered_rule and "col" in lowered_rule:
-        # e.g. "Unit Master_Col_F" or the combined
-        # "Unit Master_Col_C + Unit Master_Col_E" (Name + Address).
         parts = re.split(r"\s*\+\s*", rule_text)
         resolved_parts = []
         for part in parts:
@@ -609,9 +533,6 @@ def resolve_col_rule(
         return ", ".join(resolved_parts)
 
     if _is_col_prefixed(rule_text) and "+" in rule_text:
-        # Compound rule summing two source columns, e.g. "Col_EO+EP" (Earned
-        # Leave = PL Accrued + PL Monthly Increment) or "Col-CB+CD"
-        # (Payments Made = Salary Advance + Loan).
         total = 0.0
         any_value = False
         for part in rule_text.split("+"):
@@ -631,8 +552,6 @@ def resolve_col_rule(
         return value if value is not None else ""
 
     if rule_text.isalpha() and rule_text.isupper() and 1 <= len(rule_text) <= 3:
-        # A bare column-letter reference with no "Col" prefix at all, e.g.
-        # Form V's day-by-day columns are just "CU", "CV", "CW"...
         value = _lookup_col_ref_value(rule_text, df_col_ref, row_data)
         if value is not None:
             return value
@@ -749,10 +668,6 @@ def is_reference_cell(cell) -> bool:
 
 
 def detect_table_end_row(sheet, start_row: int, max_scan: int = 500) -> int:
-    """Find the real last pre-formatted employee row by scanning downward
-    from start_row for the template's marker fill colors (blue 'to-fill'
-    cells or yellow constants), instead of assuming a fixed row count.
-    Stops after 5 consecutive rows carry no marker fill at all."""
     last_marked_row = start_row
     blank_streak = 0
     for row_idx in range(start_row, start_row + max_scan):
@@ -814,9 +729,6 @@ def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year:
     month_label = f"{selected_month[:3]}-{year_suffix}"
 
     if form_name == "Form A":
-        # The date isn't in its own cell - it's a substring inside the A8
-        # paragraph ("...shall take effect from (date) June-26"). Replace
-        # just that trailing date token so the rest of the sentence survives.
         cell_a8 = sheet["A8"]
         current_text = str(cell_a8.value or "")
         marker = "shall take effect from (date)"
@@ -828,10 +740,8 @@ def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year:
             new_text = current_text
         safe_write(sheet, "A8", new_text)
     elif form_name == "Form E":
-        # Real cell is A5, a single combined string - not split D5/E5.
         safe_write(sheet, "A5", f"Wage Period- {selected_month}-{selected_year}")
     elif form_name == "Form IV":
-        # Real cell is A4, not G5.
         safe_write(sheet, "A4", f"Month Ending -{selected_month.upper()} {year_suffix}")
     elif form_name == "Form V":
         safe_write(sheet, "A5", f"For the period ending - {selected_month}-{selected_year}")
@@ -882,9 +792,6 @@ def verify_generated_form(
 
 
 def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | None) -> int | None:
-    """Sheet1 stacks all 6 forms' rules with the form name in column B of
-    each block (e.g. row 2 = Form A's rules, row 5 = Form C's, ...).
-    Returns the DataFrame row index for the current form's block, or None."""
     if df_mapping_rules is None or df_mapping_rules.empty or form_name is None:
         return None
     if df_mapping_rules.shape[1] < 2:
@@ -897,15 +804,88 @@ def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | N
     return None
 
 
-def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int) -> None:
-    """Auto-size every column to its content with a strict minimum of 18
-    so date/time strings never squash into ### hashes in Excel."""
+def _is_numeric_or_formula_value(value: object) -> bool:
+    """Only used by the total row and number format loops to determine numeric targets."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        if value.startswith("="):
+            return True
+        candidate = value.strip().replace(",", "")
+        if candidate:
+            try:
+                float(candidate)
+                return True
+            except ValueError:
+                return False
+    return False
+
+
+NON_SUMMABLE_HEADER_TOKENS = {
+    "signature", "account", "aadhar", "aadhaar", "pan", "uan", "regn",
+    "registration", "licence", "license", "mobile", "phone", "ward", "circle",
+    "number",
+}
+
+
+def _is_identifier_header(header_value: object) -> bool:
+    header_raw = str(header_value or "").lower()
+    tokens = set(re.findall(r"[a-z]+", header_raw))
+    return bool(tokens & NON_SUMMABLE_HEADER_TOKENS) or "a/c" in header_raw
+
+
+def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int, data_col_count: int) -> int:
+    totals_row_idx = last_data_row + 1
+    label_written = False
+
+    for col_idx in range(1, data_col_count + 1):
+        col_letter = get_column_letter(col_idx)
+        target_cell = sheet.cell(row=totals_row_idx, column=col_idx)
+        source_cell = sheet.cell(row=last_data_row, column=col_idx)
+
+        copy_cell_style(source_cell, target_cell)
+        target_cell.fill = PatternFill(fill_type=None)
+        target_cell.value = None
+
+        if col_idx <= 2:
+            continue
+
+        header_text = sheet.cell(row=header_row, column=col_idx).value
+        is_identifier_column = _is_identifier_header(header_text)
+
+        column_values = [
+            sheet.cell(row=r, column=col_idx).value for r in range(start_row, last_data_row + 1)
+        ]
+        populated_values = [v for v in column_values if v is not None and str(v).strip() != ""]
+
+        if (
+            not is_identifier_column
+            and populated_values
+            and all(_is_numeric_or_formula_value(v) for v in populated_values)
+        ):
+            target_cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{last_data_row})"
+            target_cell.font = Font(name=source_cell.font.name, size=source_cell.font.size, bold=True)
+        elif not label_written and populated_values:
+            target_cell.value = "Total"
+            target_cell.font = Font(name=source_cell.font.name, size=source_cell.font.size, bold=True)
+            label_written = True
+
+    return totals_row_idx
+
+
+def apply_column_widths_and_number_formats(
+    sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int
+) -> None:
     if last_content_row < header_row:
         return
 
     for col_idx in range(1, data_col_count + 1):
         col_letter = get_column_letter(col_idx)
         max_len = 0
+        has_decimal = False
+        is_numeric_column = True
         any_value = False
 
         header_cell = sheet.cell(row=header_row, column=col_idx)
@@ -920,9 +900,23 @@ def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row
                 continue
             text = str(value)
             max_len = max(max_len, len(text))
+            if row_idx >= start_row:
+                if _is_numeric_or_formula_value(value):
+                    if isinstance(value, float) and not value.is_integer():
+                        has_decimal = True
+                else:
+                    is_numeric_column = False
 
         if any_value:
+            # VISUAL FIX 2: Strict minimum width 18 to fix Form C hashes ###
             sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 18), 45)
+
+        if any_value and is_numeric_column:
+            number_format = "#,##0.00" if has_decimal else "#,##0"
+            for row_idx in range(start_row, last_content_row + 1):
+                cell = sheet.cell(row=row_idx, column=col_idx)
+                if _is_numeric_or_formula_value(cell.value):
+                    cell.number_format = number_format
 
 
 def generate_dynamic_form(
@@ -939,6 +933,8 @@ def generate_dynamic_form(
     template_source.seek(0)
     workbook = load_workbook(template_source)
     sheet = workbook.active
+
+    selected_month = selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July"
 
     write_header_month(sheet, selected_month, selected_year)
     if form_name:
@@ -960,22 +956,22 @@ def generate_dynamic_form(
     table_end_row = detect_table_end_row(sheet, start_row)
     capacity = max(0, table_end_row - start_row + 1)
     row_count = min(len(filtered_df), capacity)
+    
     if len(filtered_df) > capacity:
         st.warning(
             f"{form_name}: {len(filtered_df)} employees selected but the template only "
-            f"has {capacity} pre-formatted rows. Only the first {capacity} were written - "
-            f"extend the template's formatted rows to include everyone."
+            f"has {capacity} pre-formatted rows. Only the first {capacity} were written."
         )
 
-    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
     month_label = f"{active_month[:3]}-{str(selected_year)[-2:]}"
     wage_month_columns = {"Form E": "E", "Form D": "F"}
     unit_master_details = get_unit_master_details(df_units, selected_unit)
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name)
 
     data_col_count = min(sheet.max_column, 51)
-    
-    # Exact Baseline Data Logic Restoration from app (2)-old.py
+
+    # EXACT REVERT TO app (2)-old.py MAPPING LOOP
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
         row_idx = start_row + offset
@@ -984,11 +980,11 @@ def generate_dynamic_form(
             source_cell = sheet.cell(row=start_row, column=col_idx)
             copy_cell_style(source_cell, target_cell)
 
-            # Restored MANDATORY `is_reference_cell` skip logic to preserve "NIL" and "0" constants
+            # MANDATORY FIX: Restore `is_reference_cell` skip logic
+            # This preserves original template constants like "NIL" and formula columns
             if is_reference_cell(source_cell):
                 continue
 
-            # Preserve live formulas
             if isinstance(target_cell.value, str) and target_cell.value.startswith("="):
                 continue
 
@@ -1023,6 +1019,7 @@ def generate_dynamic_form(
                     df_units=df_units,
                     selected_unit=selected_unit,
                 )
+            
             safe_write(sheet, f"{get_column_letter(col_idx)}{row_idx}", cell_value)
 
         if form_name in wage_month_columns:
@@ -1042,18 +1039,24 @@ def generate_dynamic_form(
             cell.font = Font()
             cell.alignment = Alignment()
 
-    # Visual Fix 1: Safely Hide Reference Row
+    # Write Totals Row
+    totals_row_idx = start_row - 1
+    if row_count > 0:
+        last_data_row = start_row + row_count - 1
+        totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count)
+
+    # VISUAL FIX 1: Safely Hide Reference Row
     reference_row_idx = start_row - 1
     if reference_row_idx >= 1:
         for col_idx in range(1, sheet.max_column + 1):
             sheet.cell(row=reference_row_idx, column=col_idx).value = None
         sheet.row_dimensions[reference_row_idx].hidden = True
 
-    # Visual Fix 2: Apply Column Widths (Min width 18 to fix Form C ### issues)
-    last_content_row = (start_row + row_count - 1) if row_count > 0 else start_row
-    apply_column_widths(sheet, header_row, start_row, last_content_row, data_col_count)
+    # VISUAL FIX 2: Apply Column Widths
+    last_content_row = totals_row_idx if row_count > 0 else start_row - 1
+    apply_column_widths_and_number_formats(sheet, header_row, start_row, last_content_row, data_col_count)
 
-    # Visual Fix 3: Strip Background Colors & Reset Text Rotation globally (Crucial for Form C)
+    # VISUAL FIX 3: Strip Background Colors & Reset Text Rotation globally (Crucial for Form C)
     for row_idx in range(1, sheet.max_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
@@ -1114,6 +1117,7 @@ header_html = """
 </div>
 """
 st.markdown(header_html, unsafe_allow_html=True)
+
 # Load a cached/simple master view for uploader validation
 df_master = get_active_master_data()
 
@@ -1148,9 +1152,6 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl", skiprows=1)
         new_conso_df.columns = new_conso_df.columns.astype(str).str.strip()
 
-        # Requirement 2: stamp Month/Year IMMEDIATELY, before any validation
-        # runs, so the required-column check never fails on columns that
-        # this upload step itself is responsible for adding.
         new_conso_df["Year"] = int(upload_year)
         new_conso_df["Month-Year"] = f"{upload_month}-{upload_year}"
         new_conso_df["Month-Year"] = new_conso_df["Month-Year"].astype(str).str.strip()
@@ -1162,13 +1163,8 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
     if missing_cols:
         st.sidebar.error(f"❌ Missing columns: {missing_cols}")
     else:
-        # Ensure the local master exists (downloads it first if missing).
         _ = get_active_master_data()
 
-        # Read the FULL existing accumulated Conso_Data (every month ever
-        # uploaded so far) directly from the master file - df_master was
-        # loaded before this button was clicked and may be stale if two
-        # uploads happen in the same session.
         try:
             existing_df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
             existing_df.columns = existing_df.columns.astype(str).str.strip()
@@ -1176,10 +1172,6 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
             st.sidebar.error(f"❌ Failed reading existing master data before append: {e}")
             st.stop()
 
-        # Normalize the employee-code column's dtype before concatenating -
-        # different monthly uploads can read Code as int64 in one file and
-        # string in another, which otherwise produces a mixed-type column
-        # that breaks Code matching (Sr.No/QA/report lookups) downstream.
         code_col = next((c for c in existing_df.columns if "code" in c.lower()), None)
         if code_col and code_col in new_conso_df.columns:
             existing_df[code_col] = existing_df[code_col].astype(str).str.strip()
@@ -1187,17 +1179,11 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
 
         target_month_year = new_conso_df["Month-Year"].iloc[0] if not new_conso_df.empty else f"{upload_month}-{upload_year}"
 
-        # Month-level upsert: this upload is authoritative for that whole
-        # month, so drop every existing row for that exact Month-Year (a
-        # re-upload cleanly replaces the month rather than leaving stale
-        # rows behind) then append the new month on top.
         if "Month-Year" in existing_df.columns:
             existing_my = existing_df["Month-Year"].astype(str).str.strip()
             is_legacy = existing_df["Month-Year"].isna() | existing_my.isin({"", "nan", "None"})
             is_target_month = (~is_legacy) & existing_my.eq(str(target_month_year).strip())
         else:
-            # No Month-Year column exists at all yet - every existing row
-            # predates this feature and counts as legacy.
             is_legacy = pd.Series(True, index=existing_df.index)
             is_target_month = pd.Series(False, index=existing_df.index)
 
@@ -1210,28 +1196,17 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
 
         combined_df = pd.concat([existing_minus_month, new_conso_df], ignore_index=True, sort=False)
 
-        # 1a. Overwrite the Conso_Data sheet with the COMBINED (multi-month)
-        # data, preserving every other sheet (Units_Master, Coloums, Sheet1)
-        # and the exact row layout the rest of the app depends on.
         try:
             write_conso_data_sheet(MASTER_FILE_PATH, combined_df)
         except Exception as e:
             st.sidebar.error(f"❌ Failed updating Conso_Data sheet in master workbook: {e}")
             st.stop()
 
-        # 1b. Read the FRESH multi-sheet workbook bytes back from disk -
-        # never reuse in-memory bytes from before the write - so what gets
-        # emailed is guaranteed to be exactly what's now on disk.
         with open(MASTER_FILE_PATH, "rb") as f:
             updated_master_bytes = f.read()
 
-        # 1c. Email 1: strictly-cased filename so Power Automate's Condition
-        # matches it and triggers the OneDrive "Update file" action.
         email_success_1, msg_1 = email_file_to_outlook(updated_master_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
 
-        # 1d. Email 2: the archive copy carries the STAMPED data (with
-        # Year/Month-Year already added) so the OneDrive archive matches
-        # what's actually in the live master, not the raw upload.
         archive_buffer = BytesIO()
         with pd.ExcelWriter(archive_buffer, engine="openpyxl") as writer:
             new_conso_df.to_excel(writer, sheet_name="Conso_Data", index=False)
@@ -1239,9 +1214,6 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
         email_success_2, msg_2 = email_file_to_outlook(archive_buffer.getvalue(), backup_filename)
 
-        # Requirement 4: a GLOBAL cache wipe - clearing only
-        # get_active_master_data() left build_merged_view() (which
-        # actually feeds the dashboard/filters/form generator) stale.
         st.cache_data.clear()
 
         if email_success_1 and email_success_2:
@@ -1283,7 +1255,7 @@ def save_form_to_archive(
     selected_year: int,
     form_name: str,
 ) -> tuple[Path, Path]:
-    active_month = selected_month if selected_month != "All" else "July"
+    active_month = (selected_month.split("-")[0] if selected_month != "All" else "July")
     active_month_year = f"{active_month}-{selected_year}"
 
     target_static_dir = STATIC_ARCHIVE_DIR / str(selected_state) / str(selected_unit) / active_month_year
@@ -1317,7 +1289,7 @@ def compile_statutory_forms(
         errors.append(f"No template URLs configured for {selected_state}")
         return generated, errors, archive_target_dir
 
-    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
 
     for form_name in form_names:
         if form_name not in state_urls:
@@ -1504,7 +1476,7 @@ with tab1:
                         int(selected_year),
                     )
                     status.write(f"☁️ Auto-pushed to OneDrive folder: `{archive_dir}`")
-                    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+                    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
                     active_month_year = f"{active_month}-{selected_year}"
                     filename = f"{selected_state}_{selected_unit}_{selected_form}_{active_month_year}.xlsx"
                     if selected_form in generated:
@@ -1517,8 +1489,7 @@ with tab1:
                         else:
                             status.caption(f"⚠️ {email_msg}")
                     status.update(label="✅ Form generated and synced to OneDrive successfully!", state="complete")
-                active_month = selected_month if selected_month not in {"All", "", None} else "July"
-                active_month_year = f"{active_month}-{selected_year}"
+                
                 if errors:
                     for error in errors:
                         st.warning(error)
@@ -1550,7 +1521,7 @@ with tab1:
                         int(selected_year),
                     )
                     status.write(f"☁️ Auto-pushed to OneDrive folder: `{archive_dir}`")
-                    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+                    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
                     active_month_year = f"{active_month}-{selected_year}"
                     if generated:
                         zip_buffer = io.BytesIO()
@@ -1569,8 +1540,7 @@ with tab1:
                         else:
                             status.caption(f"⚠️ {email_msg}")
                     status.update(label="✅ All forms generated and synced to OneDrive successfully!", state="complete")
-                active_month = selected_month if selected_month not in {"All", "", None} else "July"
-                active_month_year = f"{active_month}-{selected_year}"
+                
                 if errors:
                     for error in errors:
                         st.warning(error)
