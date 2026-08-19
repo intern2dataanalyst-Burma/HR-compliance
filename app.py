@@ -841,11 +841,10 @@ def verify_generated_form(
         return [f"Unable to open generated workbook for QA: {exc}"]
 
     form_key = str(form_name).strip().upper() if form_name else ""
-    # These are one row LOWER than FORM_START_ROWS in generate_dynamic_form:
-    # generate_dynamic_form deletes the leftover "reference row" (start_row - 1)
-    # right before saving, which shifts every row below it up by one in the
-    # file this function actually opens and inspects.
-    start_row = {"FORM A": 18, "FORM C": 8, "FORM D": 7, "FORM E": 8, "FORM IV": 9, "FORM V": 10}.get(form_key, 8)
+    # These match FORM_START_ROWS in generate_dynamic_form exactly - the
+    # reference row is now cleared + hidden in place rather than deleted,
+    # so no row indices shift and these stay at their original positions.
+    start_row = {"FORM A": 19, "FORM C": 9, "FORM D": 8, "FORM E": 9, "FORM IV": 10, "FORM V": 11}.get(form_key, 9)
     known_codes = known_codes or set()
 
     for row_idx in range(1, start_row):
@@ -985,14 +984,7 @@ def apply_column_widths_and_number_formats(
     """Auto-size every column to its content (openpyxl has no native
     auto-fit) and apply comma-separated numeric formatting to columns whose
     values are numeric, so financial figures aren't cut off or left in raw
-    unformatted form. Also fixes the "text renders one letter per line, ###
-    on numeric cells" garbling seen in Form C: that happens when a data cell
-    inherits wrap_text=True from the template's source-row style (via
-    copy_cell_style) - a short value like "01-Apr-2026" doesn't need
-    wrapping, and wrapping it inside a too-short row squashes it into an
-    unreadable vertical stack. Data rows get wrap_text explicitly turned off
-    and a real row height; the header row's own wrap/rotation design (often
-    intentional for long compliance-register headers) is left untouched."""
+    unformatted form."""
     if last_content_row < header_row:
         return
 
@@ -1003,11 +995,22 @@ def apply_column_widths_and_number_formats(
         is_numeric_column = True
         any_value = False
 
+        header_cell = sheet.cell(row=header_row, column=col_idx)
+        header_wraps = bool(header_cell.alignment and header_cell.alignment.wrap_text)
+
         for row_idx in range(header_row, last_content_row + 1):
             value = sheet.cell(row=row_idx, column=col_idx).value
             if value is None or str(value).strip() == "":
                 continue
             any_value = True
+            if row_idx == header_row and header_wraps:
+                # The template marked this header wrap_text=True by design
+                # (e.g. "Whether employed on daily, monthly, contract or
+                # piece-rate wages, with rate" is meant to wrap onto several
+                # lines in a normal-width column) - basing the column width
+                # on its full unwrapped length instead of the data it holds
+                # was stretching some columns to 70+ characters wide.
+                continue
             text = str(value)
             max_len = max(max_len, len(text))
             if row_idx >= start_row:
@@ -1018,11 +1021,13 @@ def apply_column_widths_and_number_formats(
                     is_numeric_column = False
 
         if any_value:
-            # Strict minimum of 15 so date/time columns (e.g. "11:30:00 PM",
+            # Strict minimum of 18 so date/time columns (e.g. "11:30:00 PM",
             # "01-Jan-1999") never render as "#####" in Excel - a narrower
             # auto-fit width can fit the digit count but still be too small
-            # for Excel's date/time column-width rendering rules.
-            sheet.column_dimensions[col_letter].width = max(max_len + 2, 15)
+            # for Excel's date/time column-width rendering rules. Capped at
+            # 45 so a long, non-wrapping header still can't stretch one
+            # column across half the sheet.
+            sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 18), 45)
 
         if any_value and is_numeric_column:
             number_format = "#,##0.00" if has_decimal else "#,##0"
@@ -1030,24 +1035,6 @@ def apply_column_widths_and_number_formats(
                 cell = sheet.cell(row=row_idx, column=col_idx)
                 if _is_numeric_or_formula_value(cell.value):
                     cell.number_format = number_format
-
-    # Data rows: force wrap_text off and give every row a real height, so a
-    # short value never fragments into a vertical letter-stack the way the
-    # Form C screenshot showed. The header row keeps whatever wrap/rotation
-    # the template's own design uses - only widen its row height so that
-    # design isn't clipped, never touch its wrap setting.
-    for row_idx in range(start_row, last_content_row + 1):
-        sheet.row_dimensions[row_idx].height = 18
-        for col_idx in range(1, data_col_count + 1):
-            cell = sheet.cell(row=row_idx, column=col_idx)
-            if cell.alignment and cell.alignment.wrap_text:
-                new_alignment = copy(cell.alignment)
-                new_alignment.wrap_text = False
-                cell.alignment = new_alignment
-
-    header_row_height = sheet.row_dimensions[header_row].height
-    if not header_row_height or header_row_height < 30:
-        sheet.row_dimensions[header_row].height = 45
 
 
 def generate_dynamic_form(
@@ -1064,6 +1051,14 @@ def generate_dynamic_form(
     template_source.seek(0)
     workbook = load_workbook(template_source)
     sheet = workbook.active
+
+    # selected_month may arrive as a full "Month-Year" string (e.g.
+    # "April-2026") since that's what the dashboard's Month-Year dropdown
+    # actually holds - every date-injection helper below expects a bare
+    # month name and appends "-{selected_year}" itself, so this must be
+    # normalized FIRST, before write_header_month/inject_form_dates run,
+    # not partway through the function.
+    selected_month = selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July"
 
     write_header_month(sheet, selected_month, selected_year)
     if form_name:
@@ -1094,7 +1089,7 @@ def generate_dynamic_form(
             f"extend the template's formatted rows to include everyone."
         )
 
-    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
     month_label = f"{active_month[:3]}-{str(selected_year)[-2:]}"
     wage_month_columns = {"Form E": "E", "Form D": "F"}
     unit_master_details = get_unit_master_details(df_units, selected_unit)
@@ -1230,62 +1225,46 @@ def generate_dynamic_form(
             cell.font = Font()
             cell.alignment = Alignment()
 
+    # Hide the template's leftover "reference row" (e.g. "Sal Reg",
+    # "Emp Mast", "Unit Mast", "Attd Reg" source-annotation labels) that
+    # sits directly above the employee data at start_row - 1, instead of
+    # deleting it. Clearing values + hiding achieves the same visible
+    # result (the row is gone from view) without shifting any row indices
+    # or touching formula text at all - simpler and more robust than
+    # physically deleting the row, which would require rewriting every
+    # per-row formula's cell references (e.g. Form IV's "=N10+M10") to
+    # still point at their own row after the shift.
+    reference_row_idx = start_row - 1
+    if reference_row_idx >= 1:
+        for col_idx in range(1, sheet.max_column + 1):
+            sheet.cell(row=reference_row_idx, column=col_idx).value = None
+        sheet.row_dimensions[reference_row_idx].hidden = True
+
     last_content_row = totals_row_idx if row_count > 0 else start_row - 1
     apply_column_widths_and_number_formats(sheet, header_row, start_row, last_content_row, data_col_count)
 
-    # Delete the template's leftover "reference row" (e.g. "Sal Reg",
-    # "Emp Mast", "Unit Mast", "Attd Reg" source-annotation labels) that
-    # sits directly above the employee data at start_row - 1. All row
-    # writing/totals math above is already complete, so it's safe to
-    # physically remove this row now - openpyxl's delete_rows shifts every
-    # row below it up by one automatically.
-    reference_row_idx = start_row - 1
-    rows_deleted = 0
-    if reference_row_idx >= 1:
-        sheet.delete_rows(reference_row_idx)
-        rows_deleted = 1
-
-    if rows_deleted:
-        # openpyxl's delete_rows() physically moves cells but does NOT
-        # rewrite formula text - a template formula like "=N10+M10" that
-        # lived on row 10 stays literally "=N10+M10" even after that row's
-        # content shifts up to row 9. Left alone, every per-row formula in
-        # the data block (e.g. Form IV's "Total earning" column) would end
-        # up one row off and read a neighbouring employee's figures instead
-        # of its own - this was the actual cause of the "missing"/wrong
-        # data in Form IV and Form E. Walk the shifted employee/totals rows
-        # and shift every cell-reference row number in each formula down by
-        # the number of rows deleted above it, so each row's formula still
-        # points at its own row.
-        cell_ref_pattern = re.compile(r"(\$?[A-Za-z]{1,3})(\$?)(\d+)")
-        formula_scan_start = max(1, reference_row_idx)
-        formula_scan_end = sheet.max_row
-        for row_idx in range(formula_scan_start, formula_scan_end + 1):
-            for col_idx in range(1, sheet.max_column + 1):
-                cell = sheet.cell(row=row_idx, column=col_idx)
-                value = cell.value
-                if not (isinstance(value, str) and value.startswith("=")):
-                    continue
-
-                def _shift_ref(match: "re.Match[str]") -> str:
-                    col_part, dollar, row_part = match.group(1), match.group(2), match.group(3)
-                    if dollar == "$":
-                        # Absolute row reference (e.g. "$A$1") - a fixed
-                        # anchor like a header row, never a per-row cell -
-                        # leave it untouched.
-                        return match.group(0)
-                    new_row_num = max(1, int(row_part) - rows_deleted)
-                    return f"{col_part}{dollar}{new_row_num}"
-
-                cell.value = cell_ref_pattern.sub(_shift_ref, value)
-
-    # Strip ALL background colors globally. The final output must have zero
-    # background fills (no blue "to-fill" marker, no yellow constant marker,
-    # no green) anywhere in the populated area of the sheet.
+    # Strip ALL background colors AND text rotation globally. The final
+    # output must have zero background fills (no blue "to-fill" marker, no
+    # yellow constant marker, no green) anywhere in the populated area of
+    # the sheet. Text rotation is also stripped: verified directly against
+    # the raw source templates that several columns (e.g. Form C's Opening
+    # Balance through Employee signature block) have text_rotation=90 baked
+    # into both the header row AND the pre-formatted data rows by the
+    # template's original author - this is what rendered headers as
+    # illegible vertically-stacked single characters, and combined with
+    # column auto-width (which assumes horizontal text) is what produced
+    # the "#####" display artifacts.
     for row_idx in range(1, sheet.max_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             cell.fill = PatternFill(fill_type=None)
+            if cell.alignment and cell.alignment.text_rotation:
+                cell.alignment = Alignment(
+                    horizontal=cell.alignment.horizontal,
+                    vertical=cell.alignment.vertical,
+                    wrap_text=cell.alignment.wrap_text,
+                    text_rotation=0,
+                )
 
     output = BytesIO()
     workbook.save(output)
@@ -1504,7 +1483,7 @@ def save_form_to_archive(
     selected_year: int,
     form_name: str,
 ) -> tuple[Path, Path]:
-    active_month = selected_month if selected_month != "All" else "July"
+    active_month = (selected_month.split("-")[0] if selected_month != "All" else "July")  # selected_month may be a full Month-Year string
     active_month_year = f"{active_month}-{selected_year}"
 
     target_static_dir = STATIC_ARCHIVE_DIR / str(selected_state) / str(selected_unit) / active_month_year
@@ -1538,7 +1517,7 @@ def compile_statutory_forms(
         errors.append(f"No template URLs configured for {selected_state}")
         return generated, errors, archive_target_dir
 
-    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
 
     for form_name in form_names:
         if form_name not in state_urls:
@@ -1725,7 +1704,7 @@ with tab1:
                         int(selected_year),
                     )
                     status.write(f"☁️ Auto-pushed to OneDrive folder: `{archive_dir}`")
-                    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+                    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
                     active_month_year = f"{active_month}-{selected_year}"
                     filename = f"{selected_state}_{selected_unit}_{selected_form}_{active_month_year}.xlsx"
                     if selected_form in generated:
@@ -1738,7 +1717,7 @@ with tab1:
                         else:
                             status.caption(f"⚠️ {email_msg}")
                     status.update(label="✅ Form generated and synced to OneDrive successfully!", state="complete")
-                active_month = selected_month if selected_month not in {"All", "", None} else "July"
+                active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
                 active_month_year = f"{active_month}-{selected_year}"
                 if errors:
                     for error in errors:
@@ -1771,7 +1750,7 @@ with tab1:
                         int(selected_year),
                     )
                     status.write(f"☁️ Auto-pushed to OneDrive folder: `{archive_dir}`")
-                    active_month = selected_month if selected_month not in {"All", "", None} else "July"
+                    active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
                     active_month_year = f"{active_month}-{selected_year}"
                     if generated:
                         zip_buffer = io.BytesIO()
@@ -1790,7 +1769,7 @@ with tab1:
                         else:
                             status.caption(f"⚠️ {email_msg}")
                     status.update(label="✅ All forms generated and synced to OneDrive successfully!", state="complete")
-                active_month = selected_month if selected_month not in {"All", "", None} else "July"
+                active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")  # selected_month may be a full Month-Year string
                 active_month_year = f"{active_month}-{selected_year}"
                 if errors:
                     for error in errors:
