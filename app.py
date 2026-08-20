@@ -439,22 +439,34 @@ def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: s
 
 
 def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
-    """EXACT LOGIC FROM app (2)-old.py
-    Look up a Coloums letter (e.g. 'B', 'EN') and return that field's
-    value from the employee row dict."""
+    """Exact logic from app(2)-old.py, fortified to safely link columns even if the 
+    Excel file contains invisible trailing spaces or underscores."""
     if not letter or df_col_ref is None or df_col_ref.empty:
         return None
     df_col_ref = df_col_ref.copy()
     df_col_ref.columns = df_col_ref.columns.astype(str).str.strip()
     if len(df_col_ref.columns) < 2:
         return None
+    
     lookup = df_col_ref.iloc[:, 0].astype(str).str.strip().str.upper()
     values = df_col_ref.iloc[:, 1].astype(str).str.strip()
     match_idx = lookup[lookup == letter].index
+    
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
+        
+        # 1. Exact match attempt
         if col_name in row_data:
-            return row_data.get(col_name, "")
+            val = row_data.get(col_name, "")
+            return val if not pd.isna(val) else ""
+            
+        # 2. Fuzzy match safety net (ignores hidden Excel spaces)
+        clean_target = re.sub(r"[\s\n_]+", "", str(col_name)).lower()
+        for key, value in row_data.items():
+            clean_key = re.sub(r"[\s\n_]+", "", str(key)).lower()
+            if clean_key == clean_target:
+                return value if not pd.isna(value) else ""
+                
     return None
 
 
@@ -650,11 +662,7 @@ def safe_write(sheet, cell_coordinate: str, value) -> None:
 TEMPLATE_MARKER_FILLS = {"FFBDD6EE", "FFFFFF00", "FF9CC2E5"}
 
 def is_reference_cell(cell) -> bool:
-    """EXACT LOGIC FROM app (2)-old.py
-    True for cells filled with the template's yellow 'reference/constant'
-    color - these hold values that are the same for every employee (shift
-    timings, 'Monthly', 'Approved in HRMS', etc.) or are intentionally
-    manual/exception-only fields, and must never be blanked out."""
+    """True for cells filled with the template's yellow 'reference/constant' color."""
     fill = cell.fill
     if fill and fill.fgColor and fill.fgColor.type == "rgb":
         return fill.fgColor.rgb == "FFFFFF00"
@@ -753,8 +761,7 @@ def verify_generated_form(
         return [f"Unable to open generated workbook for QA: {exc}"]
 
     form_key = str(form_name).strip().upper() if form_name else ""
-    # The reference row is deleted before this QA check, so start_row shifts up by 1
-    start_row = {"FORM A": 18, "FORM C": 8, "FORM D": 7, "FORM E": 8, "FORM IV": 9, "FORM V": 10}.get(form_key, 8)
+    start_row = {"FORM A": 19, "FORM C": 9, "FORM D": 8, "FORM E": 9, "FORM IV": 10, "FORM V": 11}.get(form_key, 9)
     known_codes = known_codes or set()
 
     for row_idx in range(1, start_row):
@@ -798,7 +805,6 @@ def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | N
     return None
 
 def _is_numeric_or_formula_value_for_totals(value: object) -> bool:
-    """Helper specifically for the Totals Row functionality."""
     if isinstance(value, bool):
         return False
     if isinstance(value, (int, float)):
@@ -865,7 +871,6 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
     return totals_row_idx
 
 def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int) -> None:
-    """Auto-size every column to its content with a strict minimum of 18."""
     if last_content_row < header_row:
         return
 
@@ -889,6 +894,7 @@ def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row
 
         if any_value:
             sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 18), 45)
+
 
 def generate_dynamic_form(
     filtered_df: pd.DataFrame,
@@ -942,7 +948,6 @@ def generate_dynamic_form(
 
     data_col_count = min(sheet.max_column, 51)
 
-    # EXACT REVERT TO app (2)-old.py MAPPING LOOP
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
         row_idx = start_row + offset
@@ -951,8 +956,6 @@ def generate_dynamic_form(
             source_cell = sheet.cell(row=start_row, column=col_idx)
             copy_cell_style(source_cell, target_cell)
 
-            # MANDATORY FIX: Restore `is_reference_cell` skip logic
-            # This preserves original template constants like "NIL" and formula columns
             if is_reference_cell(source_cell):
                 continue
 
@@ -1000,15 +1003,15 @@ def generate_dynamic_form(
             copy_cell_style(sheet.cell(row=start_row, column=month_col_idx), month_cell)
             safe_write(sheet, month_cell.coordinate, month_label)
 
-    # VISUAL FIX 2: Apply Totals Row
+    # ADD TOTALS ROW SAFELY
     totals_row_idx = start_row - 1
     if row_count > 0:
         last_data_row = start_row + row_count - 1
         totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count)
 
-    # VISUAL FIX 3: Clear unused template rows to the absolute bottom (wipes footers)
+    # Clear remaining unused template rows inside the blue/yellow boundary (Leaves footers untouched)
     clear_start_row = totals_row_idx + 1
-    for row_idx in range(clear_start_row, sheet.max_row + 1):
+    for row_idx in range(clear_start_row, table_end_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             safe_write(sheet, cell.coordinate, None)
@@ -1017,38 +1020,18 @@ def generate_dynamic_form(
             cell.font = Font()
             cell.alignment = Alignment()
 
-    # VISUAL FIX 1: Physically Delete the Reference Row & Shift Formulas
+    # VISUAL FIX 1: Safely Hide Reference Row
     reference_row_idx = start_row - 1
-    rows_deleted = 0
     if reference_row_idx >= 1:
-        sheet.delete_rows(reference_row_idx)
-        rows_deleted = 1
+        for col_idx in range(1, sheet.max_column + 1):
+            sheet.cell(row=reference_row_idx, column=col_idx).value = None
+        sheet.row_dimensions[reference_row_idx].hidden = True
 
-    if rows_deleted:
-        cell_ref_pattern = re.compile(r"(\$?[A-Za-z]{1,3})(\$?)(\d+)")
-        formula_scan_start = max(1, reference_row_idx)
-        formula_scan_end = sheet.max_row
-        for row_idx in range(formula_scan_start, formula_scan_end + 1):
-            for col_idx in range(1, sheet.max_column + 1):
-                cell = sheet.cell(row=row_idx, column=col_idx)
-                value = cell.value
-                if not (isinstance(value, str) and value.startswith("=")):
-                    continue
+    # VISUAL FIX 2: Apply Column Widths
+    last_content_row = totals_row_idx if row_count > 0 else start_row - 1
+    apply_column_widths(sheet, header_row, start_row, last_content_row, data_col_count)
 
-                def _shift_ref(match: "re.Match[str]") -> str:
-                    col_part, dollar, row_part = match.group(1), match.group(2), match.group(3)
-                    if dollar == "$":
-                        return match.group(0)
-                    new_row_num = max(1, int(row_part) - rows_deleted)
-                    return f"{col_part}{dollar}{new_row_num}"
-
-                cell.value = cell_ref_pattern.sub(_shift_ref, value)
-
-    # VISUAL FIX 4: Column Widths Minimum 18
-    # Notice we adjust start_row/last_content_row by -1 because the row was physically deleted!
-    apply_column_widths(sheet, header_row, start_row - 1, totals_row_idx - 1, data_col_count)
-
-    # VISUAL FIX 5: Strip ALL background colors globally and fix text rotation for Form C
+    # VISUAL FIX 3: Strip Background Colors & Reset Text Rotation globally (Crucial for Form C)
     for row_idx in range(1, sheet.max_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
