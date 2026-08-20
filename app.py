@@ -66,7 +66,6 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.xlsx"
 ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
 
-# 1. Automatically create .streamlit/config.toml and enable static file serving if missing
 config_dir = BASE_DIR / ".streamlit"
 config_dir.mkdir(parents=True, exist_ok=True)
 config_file = config_dir / "config.toml"
@@ -74,12 +73,10 @@ if not config_file.exists() or "enableStaticServing" not in config_file.read_tex
     with open(config_file, "a", encoding="utf-8") as f:
         f.write("\n[server]\nenableStaticServing = true\n")
 
-# 2. Primary Archive for Web Linking (Streamlit Static HTTP Server)
 STATIC_ARCHIVE_DIR = BASE_DIR / "static" / "HR_Compliance_Archive"
 STATIC_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_WEB_PREFIX = "app/static/HR_Compliance_Archive"
 
-# 3. Secondary Archive for Windows OneDrive Cloud Sync
 user_home = Path.home()
 onedrive_path_secret = st.secrets.get("archive", {}).get("onedrive_path", None)
 if onedrive_path_secret and Path(onedrive_path_secret).parent.exists():
@@ -439,7 +436,7 @@ def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: s
 
 
 def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
-    """Restored from app (2)-old.py with an added fuzzy fallback to ensure mapped 
+    """Restored from app (2)-old.py with a fuzzy fallback to ensure mapped 
     columns like 'Fixed Monthly Gross' never return blank due to hidden Excel spaces."""
     if not letter or df_col_ref is None or df_col_ref.empty:
         return None
@@ -455,12 +452,12 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
         
-        # 1. Exact match (from app (2)-old.py)
+        # 1. Exact match attempt
         if col_name in row_data:
             val = row_data.get(col_name, "")
             return val if not pd.isna(val) else ""
             
-        # 2. Fuzzy match safety net (strips hidden spaces/newlines)
+        # 2. Fuzzy match safety net (ignores hidden Excel spaces)
         clean_target = re.sub(r"[\s\n_]+", "", str(col_name)).lower()
         for key, value in row_data.items():
             clean_key = re.sub(r"[\s\n_]+", "", str(key)).lower()
@@ -662,8 +659,6 @@ def safe_write(sheet, cell_coordinate: str, value) -> None:
 TEMPLATE_MARKER_FILLS = {"FFBDD6EE", "FFFFFF00", "FF9CC2E5"}
 
 def is_reference_cell(cell) -> bool:
-    """RESTORED FROM app (2)-old.py
-    Protects original template formulas and constant text like 'NIL'"""
     fill = cell.fill
     if fill and fill.fgColor and fill.fgColor.type == "rgb":
         return fill.fgColor.rgb == "FFFFFF00"
@@ -873,7 +868,6 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
     return totals_row_idx
 
 def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int) -> None:
-    """Auto-size every column to its content with a strict minimum of 18."""
     if last_content_row < header_row:
         return
 
@@ -897,6 +891,100 @@ def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row
 
         if any_value:
             sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 18), 45)
+
+
+def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col_ref, template_bytes):
+    """Generates a DataFrame log showing exactly why cells might be turning up blank."""
+    if filtered_df.empty:
+        st.error("No employees found to test mapping.")
+        return
+
+    row = filtered_df.iloc[0].to_dict()
+    template_bytes.seek(0)
+    workbook = load_workbook(template_bytes)
+    sheet = workbook.active
+    
+    header_row = find_header_row(sheet)
+    header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 52)]
+    
+    FORM_START_ROWS = {"FORM A": 19, "FORM C": 9, "FORM D": 8, "FORM E": 9, "FORM IV": 10, "FORM V": 11}
+    start_row = FORM_START_ROWS.get(form_name.upper().strip(), 9)
+    form_rule_row = find_form_rule_row(df_mapping_rules, form_name)
+    
+    logs = []
+    
+    for col_idx in range(1, 25): # Check first 25 columns
+        col_letter = get_column_letter(col_idx)
+        header_val = str(header_cells[col_idx-1]).replace("\n", " ") if col_idx <= len(header_cells) else ""
+        source_cell = sheet.cell(row=start_row, column=col_idx)
+        
+        is_ref = is_reference_cell(source_cell)
+        is_formula = isinstance(source_cell.value, str) and source_cell.value.startswith("=")
+        
+        rule = ""
+        if form_rule_row is not None:
+            rule_candidate = df_mapping_rules.iloc[form_rule_row, col_idx + 7]
+            if pd.notna(rule_candidate):
+                rule = str(rule_candidate).strip()
+                if rule == 'nan': rule = ""
+                
+        mapped_target = ""
+        extracted_value = ""
+        note = ""
+
+        if is_ref:
+            extracted_value = "[SKIPPED: YELLOW TEMPLATE CELL]"
+            note = f"Protected template constant: {source_cell.value}"
+        elif is_formula:
+            extracted_value = "[SKIPPED: TEMPLATE FORMULA]"
+            note = f"Protected formula: {source_cell.value}"
+        elif _is_col_prefixed(rule):
+            letter = _extract_col_letter(rule)
+            lookup = df_col_ref.iloc[:, 0].astype(str).str.strip().str.upper()
+            values = df_col_ref.iloc[:, 1].astype(str).str.strip()
+            match_idx = lookup[lookup == letter].index
+            
+            if len(match_idx) > 0:
+                mapped_target = values.iloc[match_idx[0]]
+                if mapped_target in row:
+                    val = row.get(mapped_target, "")
+                    extracted_value = str(val) if not pd.isna(val) else ""
+                    note = "✅ Exact match successful"
+                else:
+                    # Fuzzy match check
+                    clean_target = re.sub(r"[\s\n_]+", "", str(mapped_target)).lower()
+                    fuzzy_found = False
+                    for k, v in row.items():
+                        if re.sub(r"[\s\n_]+", "", str(k)).lower() == clean_target:
+                            extracted_value = str(v) if not pd.isna(v) else ""
+                            note = f"⚠️ Exact match failed. Fuzzy matched to key: '{k}'"
+                            fuzzy_found = True
+                            break
+                    if not fuzzy_found:
+                        extracted_value = "BLANK"
+                        close_keys = [k for k in row.keys() if 'Gross' in str(k) or 'Wage' in str(k) or 'Earn' in str(k)]
+                        note = f"❌ TARGET '{mapped_target}' NOT FOUND. Similar keys in data: {close_keys}"
+            else:
+                note = f"❌ Rule letter {letter} not found in Coloums mapping sheet!"
+        elif rule:
+            extracted_value = "..."
+            note = f"Evaluated via manual rule: {rule}"
+        else:
+            extracted_value = "..."
+            note = "Fallback to direct header matching"
+
+        logs.append({
+            "Excel Column": f"{col_letter} ({col_idx})",
+            "Template Header": header_val[:35] + "..." if len(header_val) > 35 else header_val,
+            "Sheet1 Rule": rule,
+            "Mapped To (Coloums)": mapped_target,
+            "Value Found in Data": extracted_value,
+            "Diagnostic Note": note
+        })
+        
+    st.markdown(f"### Diagnostic Trace for {form_name}")
+    st.markdown("This table shows exactly how the code is matching data to the template columns for the first employee. Use this to spot misspelled headers or missing data.")
+    st.dataframe(pd.DataFrame(logs), use_container_width=True)
 
 
 def generate_dynamic_form(
@@ -951,7 +1039,6 @@ def generate_dynamic_form(
 
     data_col_count = min(sheet.max_column, 51)
 
-    # EXACT REVERT TO app (2)-old.py MAPPING LOOP
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
         row_idx = start_row + offset
@@ -960,7 +1047,6 @@ def generate_dynamic_form(
             source_cell = sheet.cell(row=start_row, column=col_idx)
             copy_cell_style(source_cell, target_cell)
 
-            # MANDATORY FIX: Restore `is_reference_cell` skip logic
             if is_reference_cell(source_cell):
                 continue
 
@@ -1014,7 +1100,7 @@ def generate_dynamic_form(
         last_data_row = start_row + row_count - 1
         totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count)
 
-    # Clear remaining unused template rows inside the blue/yellow boundary (Leaves footers untouched)
+    # Clear remaining unused template rows
     clear_start_row = totals_row_idx + 1
     for row_idx in range(clear_start_row, table_end_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
@@ -1036,7 +1122,7 @@ def generate_dynamic_form(
     last_content_row = totals_row_idx if row_count > 0 else start_row - 1
     apply_column_widths(sheet, header_row, start_row, last_content_row, data_col_count)
 
-    # VISUAL FIX 3: Strip Background Colors & Reset Text Rotation globally (Crucial for Form C)
+    # VISUAL FIX 3: Strip Background Colors & Reset Text Rotation globally
     for row_idx in range(1, sheet.max_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
@@ -1331,37 +1417,6 @@ def build_archive_zip(file_paths: list[Path]) -> BytesIO:
     return zip_buffer
 
 
-def list_archive_records() -> pd.DataFrame:
-    records = []
-    for state_dir in sorted(STATIC_ARCHIVE_DIR.iterdir()):
-        if not state_dir.is_dir():
-            continue
-        for unit_dir in sorted(state_dir.iterdir()):
-            if not unit_dir.is_dir():
-                continue
-            for month_dir in sorted(unit_dir.iterdir()):
-                if not month_dir.is_dir():
-                    continue
-                for archive_file in sorted(month_dir.glob("*.xlsx")):
-                    relative_link = f"{STATIC_WEB_PREFIX}/{state_dir.name}/{unit_dir.name}/{month_dir.name}/{archive_file.name}"
-                    records.append(
-                        {
-                            "Form Name": archive_file.stem.replace(f"{state_dir.name}_{unit_dir.name}_", ""),
-                            "State / Region": state_dir.name,
-                            "Outlet / Brand Unit": unit_dir.name,
-                            "Wage Month": month_dir.name,
-                            "OneDrive File Link": relative_link,
-                        }
-                    )
-    return pd.DataFrame(records)
-
-
-def clear_archive_directory(target_dir: Path) -> None:
-    if target_dir.exists() and target_dir.is_dir():
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-
 tab1, tab2 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms"])
 
 with tab1:
@@ -1435,7 +1490,7 @@ with tab1:
         else:
             st.warning(f"No statutory form templates configured for {selected_state}.")
 
-        gen_col1, gen_col2 = st.columns(2)
+        gen_col1, gen_col2, debug_col = st.columns(3)
         with gen_col1:
             selected_form = st.selectbox(
                 "Select Statutory Form",
@@ -1554,6 +1609,32 @@ with tab1:
                                 mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
                                 key=f"dl_individual_{form_name}",
                             )
+        
+        with debug_col:
+            # NEW: DIAGNOSTIC TOOL BUTTON
+            if st.button("🛠️ Run Diagnostic Data Test (Debug Blank Cells)", key="run_diagnostic"):
+                if selected_month in {"All", "", None}:
+                    st.error("❌ Select a specific Month-Year to run the diagnostic test.")
+                    st.stop()
+                
+                state_urls = st.secrets.get("templates", {}).get(selected_state, {})
+                if selected_form not in state_urls:
+                    st.error("Template URL missing for the selected form.")
+                    st.stop()
+                    
+                response = requests.get(state_urls[selected_form], timeout=15)
+                response.raise_for_status()
+                template_bytes = io.BytesIO(response.content)
+                
+                run_diagnostic_mapping_test(
+                    selected_form, 
+                    filtered_df, 
+                    df_mapping_rules, 
+                    df_col_ref, 
+                    template_bytes
+                )
+
+
 with tab2:
     st.markdown("### OneDrive Form Archive Browser")
     if st.button("🗑️ Clear All OneDrive Archived Forms", key="clear_all_archive_forms"):
