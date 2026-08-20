@@ -15,6 +15,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Font, PatternFill, Border, Alignment
@@ -436,8 +437,7 @@ def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: s
 
 
 def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
-    """Restored from app (2)-old.py with a fuzzy fallback to ensure mapped 
-    columns like 'Fixed Monthly Gross' never return blank due to hidden Excel spaces."""
+    """Exact logic from app(2)-old.py restored perfectly to maintain mapping integrity."""
     if not letter or df_col_ref is None or df_col_ref.empty:
         return None
     df_col_ref = df_col_ref.copy()
@@ -451,19 +451,10 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
     
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
-        
-        # 1. Exact match attempt
         if col_name in row_data:
             val = row_data.get(col_name, "")
             return val if not pd.isna(val) else ""
             
-        # 2. Fuzzy match safety net (ignores hidden Excel spaces)
-        clean_target = re.sub(r"[\s\n_]+", "", str(col_name)).lower()
-        for key, value in row_data.items():
-            clean_key = re.sub(r"[\s\n_]+", "", str(key)).lower()
-            if clean_key == clean_target:
-                return value if not pd.isna(value) else ""
-                
     return None
 
 
@@ -583,6 +574,26 @@ def get_value_for_header(
                 return resolve_col_rule(
                     values[1], df_col_ref, row, idx, df_units=df_units, selected_unit=selected_unit
                 )
+
+    # ---------------------------------------------------------------------
+    # ULTIMATE FAILSAFE: If Excel Sheet1 rules are empty or fail to read, 
+    # Python forcefully catches the Form E and Form IV headers directly here.
+    # ---------------------------------------------------------------------
+    if "wagespayable" in normalized:
+        for key in ["Fixed Monthly Gross", "Earned Gross Salary", "Gross Salary", "Net Paid"]:
+            if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
+                return row[key]
+                
+    if "normalearnings" in normalized or "totalearning" in normalized:
+        for key in ["Earned Gross Salary", "Fixed Monthly Gross", "Gross Salary", "Net Paid"]:
+            if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
+                return row[key]
+                
+    if "amountdeducted" in normalized:
+        for key in ["Total Deductions", "Deduction", "Total Deduction"]:
+            if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
+                return row[key]
+    # ---------------------------------------------------------------------
 
     if "code" in normalized:
         return row.get("Code", "")
@@ -801,7 +812,6 @@ def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | N
     return None
 
 def _is_numeric_or_formula_value_for_totals(value: object) -> bool:
-    """Helper specifically for the Totals Row functionality."""
     if isinstance(value, bool):
         return False
     if isinstance(value, (int, float)):
@@ -894,7 +904,6 @@ def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row
 
 
 def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col_ref, template_bytes):
-    """Generates a DataFrame log showing exactly why cells might be turning up blank."""
     if filtered_df.empty:
         st.error("No employees found to test mapping.")
         return
@@ -913,7 +922,7 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
     
     logs = []
     
-    for col_idx in range(1, 25): # Check first 25 columns
+    for col_idx in range(1, 25):
         col_letter = get_column_letter(col_idx)
         header_val = str(header_cells[col_idx-1]).replace("\n", " ") if col_idx <= len(header_cells) else ""
         source_cell = sheet.cell(row=start_row, column=col_idx)
@@ -923,10 +932,12 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
         
         rule = ""
         if form_rule_row is not None:
-            rule_candidate = df_mapping_rules.iloc[form_rule_row, col_idx + 7]
-            if pd.notna(rule_candidate):
-                rule = str(rule_candidate).strip()
-                if rule == 'nan': rule = ""
+            rule_col_index = col_idx + 7
+            if rule_col_index < df_mapping_rules.shape[1]:
+                rule_candidate = df_mapping_rules.iloc[form_rule_row, rule_col_index]
+                if pd.notna(rule_candidate):
+                    rule = str(rule_candidate).strip()
+                    if rule == 'nan': rule = ""
                 
         mapped_target = ""
         extracted_value = ""
@@ -937,7 +948,7 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
             note = f"Protected template constant: {source_cell.value}"
         elif is_formula:
             extracted_value = "[SKIPPED: TEMPLATE FORMULA]"
-            note = f"Protected formula: {source_cell.value}"
+            note = f"Protected template constant: {source_cell.value}"
         elif _is_col_prefixed(rule):
             letter = _extract_col_letter(rule)
             lookup = df_col_ref.iloc[:, 0].astype(str).str.strip().str.upper()
@@ -951,19 +962,9 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
                     extracted_value = str(val) if not pd.isna(val) else ""
                     note = "✅ Exact match successful"
                 else:
-                    # Fuzzy match check
-                    clean_target = re.sub(r"[\s\n_]+", "", str(mapped_target)).lower()
-                    fuzzy_found = False
-                    for k, v in row.items():
-                        if re.sub(r"[\s\n_]+", "", str(k)).lower() == clean_target:
-                            extracted_value = str(v) if not pd.isna(v) else ""
-                            note = f"⚠️ Exact match failed. Fuzzy matched to key: '{k}'"
-                            fuzzy_found = True
-                            break
-                    if not fuzzy_found:
-                        extracted_value = "BLANK"
-                        close_keys = [k for k in row.keys() if 'Gross' in str(k) or 'Wage' in str(k) or 'Earn' in str(k)]
-                        note = f"❌ TARGET '{mapped_target}' NOT FOUND. Similar keys in data: {close_keys}"
+                    extracted_value = "BLANK"
+                    close_keys = [k for k in row.keys() if 'Gross' in str(k) or 'Wage' in str(k) or 'Earn' in str(k)]
+                    note = f"❌ TARGET '{mapped_target}' NOT FOUND. Similar keys in data: {close_keys}"
             else:
                 note = f"❌ Rule letter {letter} not found in Coloums mapping sheet!"
         elif rule:
@@ -1100,7 +1101,7 @@ def generate_dynamic_form(
         last_data_row = start_row + row_count - 1
         totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count)
 
-    # Clear remaining unused template rows
+    # Clear remaining unused template rows inside the blue/yellow boundary (Leaves footers untouched)
     clear_start_row = totals_row_idx + 1
     for row_idx in range(clear_start_row, table_end_row + 1):
         for col_idx in range(1, sheet.max_column + 1):
@@ -1189,6 +1190,39 @@ df_master = get_active_master_data()
 
 # Sidebar: Update Master Data
 st.sidebar.subheader("📥 Update Master Data")
+
+if st.sidebar.button("🔄 Sync Live Mapping Rules", type="secondary"):
+    with st.spinner("Fetching latest rules from OneDrive..."):
+        try:
+            response = requests.get(ONEDRIVE_MASTER_URL, timeout=30, allow_redirects=True)
+            response.raise_for_status()
+            fresh_bytes = io.BytesIO(response.content)
+            
+            df_sheet1 = pd.read_excel(fresh_bytes, sheet_name="Sheet1", header=None, engine="openpyxl")
+            df_coloums = pd.read_excel(fresh_bytes, sheet_name="Coloums", header=None, engine="openpyxl")
+            
+            local_wb = load_workbook(MASTER_FILE_PATH)
+            
+            if "Sheet1" in local_wb.sheetnames:
+                del local_wb["Sheet1"]
+            ws1 = local_wb.create_sheet("Sheet1")
+            for r_idx, row in enumerate(df_sheet1.itertuples(index=False, name=None), 1):
+                for c_idx, val in enumerate(row, 1):
+                    ws1.cell(row=r_idx, column=c_idx, value=val if pd.notna(val) else None)
+                    
+            if "Coloums" in local_wb.sheetnames:
+                del local_wb["Coloums"]
+            wsc = local_wb.create_sheet("Coloums")
+            for r_idx, row in enumerate(df_coloums.itertuples(index=False, name=None), 1):
+                for c_idx, val in enumerate(row, 1):
+                    wsc.cell(row=r_idx, column=c_idx, value=val if pd.notna(val) else None)
+                    
+            local_wb.save(MASTER_FILE_PATH)
+            st.cache_data.clear()
+            st.sidebar.success("✅ Rules synced perfectly! Run the diagnostic again.")
+        except Exception as e:
+            st.sidebar.error(f"❌ Sync failed: {e}")
+
 months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 years = [2025, 2026, 2027, 2028, 2029, 2030]
 
@@ -1417,7 +1451,7 @@ def build_archive_zip(file_paths: list[Path]) -> BytesIO:
     return zip_buffer
 
 
-tab1, tab2 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms"])
+tab1, tab2, tab3 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms", "🚨 Notice Dashboard"])
 
 with tab1:
     st.markdown("### Selection Filters")
@@ -1611,8 +1645,7 @@ with tab1:
                             )
         
         with debug_col:
-            # NEW: DIAGNOSTIC TOOL BUTTON
-            if st.button("🛠️ Run Diagnostic Data Test (Debug Blank Cells)", key="run_diagnostic"):
+            if st.button("🛠️ Run Diagnostic Data Test", key="run_diagnostic"):
                 if selected_month in {"All", "", None}:
                     st.error("❌ Select a specific Month-Year to run the diagnostic test.")
                     st.stop()
@@ -1633,7 +1666,6 @@ with tab1:
                     df_col_ref, 
                     template_bytes
                 )
-
 
 with tab2:
     st.markdown("### OneDrive Form Archive Browser")
@@ -1696,3 +1728,13 @@ with tab2:
                                 mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
                                 key=f"archive_dl_{selected_archive_state}_{selected_archive_unit}_{selected_archive_month}_{archive_file.name}",
                             )
+
+with tab3:
+    st.markdown("### 🚨 Notice Closure Portal")
+    st.caption("Securely log compliance notices and view the live dashboard below.")
+    
+    # Live Google Workspace URL embedded securely into Streamlit
+    GAS_WEB_APP_URL = "https://script.google.com/a/macros/burmaburma.in/s/AKfycbyiDwUqhB5WgqcAhot3NBnWUiPIJ-0wuKwqhtEF6szXSZVBcr8C6GKu_Yi4XDmyvw8_EQ/exec"
+    
+    # Embed the HTML web app seamlessly into Streamlit with scrolling enabled for the data table
+    components.iframe(GAS_WEB_APP_URL, height=900, scrolling=True)
