@@ -5,6 +5,7 @@ import re
 import shutil
 import smtplib
 import tempfile
+import time
 import zipfile
 from copy import copy
 from datetime import datetime
@@ -93,22 +94,56 @@ if ONEDRIVE_ARCHIVE_DIR:
     ONEDRIVE_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def fetch_onedrive_file_with_retry(url: str, max_retries: int = 4, delay: int = 2) -> bytes:
+    """
+    Downloads a file from SharePoint/OneDrive with browser headers 
+    and automatic exponential backoff retries against 503/429 errors.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+    
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+            if response.status_code == 200:
+                head = response.content[:200].lower()
+                if b"<html" in head or b"<!doctype html" in head:
+                    raise RuntimeError("OneDrive returned a login webpage instead of the direct Excel file.")
+                return response.content
+            
+            response.raise_for_status()
+        except Exception as err:
+            last_exception = err
+            if attempt < max_retries:
+                time.sleep(delay * attempt)
+            else:
+                break
+
+    raise last_exception
+
+
 @st.cache_data(ttl=3600)
 def get_active_master_data():
     if not os.path.exists(MASTER_FILE_PATH):
         try:
             os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
-            response = requests.get(ONEDRIVE_MASTER_URL, timeout=30, allow_redirects=True)
-            response.raise_for_status()
-            head = response.content[:200].lower()
-            if b"<html" in head or b"<!doctype html" in head:
-                st.error("❌ OneDrive URL returned a webpage instead of an Excel file. Please check share link permissions.")
-                st.stop()
+            content = fetch_onedrive_file_with_retry(ONEDRIVE_MASTER_URL)
             with open(MASTER_FILE_PATH, "wb") as f:
-                f.write(response.content)
+                f.write(content)
         except Exception as e:
-            st.error(f"❌ Failed to fetch Master Data from OneDrive: {e}")
+            st.error(f"❌ Failed to fetch Master Data from OneDrive (503 / Network Error): {e}")
+            if st.button("🔄 Retry Connection to OneDrive"):
+                st.cache_data.clear()
+                st.rerun()
             st.stop()
+            
     try:
         df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
         df.columns = df.columns.astype(str).str.strip()
@@ -196,12 +231,12 @@ def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             with open(MASTER_FILE_PATH, "rb") as f:
                 file_bytes = io.BytesIO(f.read())
         else:
-            excel_url = st.secrets.get("EXCEL_FILE_URL")
-            if not excel_url:
-                raise RuntimeError("EXCEL_FILE_URL not configured in secrets and no local master file present.")
-            response = requests.get(excel_url, timeout=15)
-            response.raise_for_status()
-            file_bytes = io.BytesIO(response.content)
+            excel_url = st.secrets.get("EXCEL_FILE_URL") or ONEDRIVE_MASTER_URL
+            content = fetch_onedrive_file_with_retry(excel_url)
+            file_bytes = io.BytesIO(content)
+            os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
+            with open(MASTER_FILE_PATH, "wb") as f:
+                f.write(content)
 
         df_conso = pd.read_excel(file_bytes, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
         df_units = pd.read_excel(file_bytes, sheet_name="Units_Master", skiprows=1, engine="openpyxl")
@@ -1194,9 +1229,8 @@ st.sidebar.subheader("📥 Update Master Data")
 if st.sidebar.button("🔄 Sync Live Mapping Rules", type="secondary"):
     with st.spinner("Fetching latest rules from OneDrive..."):
         try:
-            response = requests.get(ONEDRIVE_MASTER_URL, timeout=30, allow_redirects=True)
-            response.raise_for_status()
-            fresh_bytes = io.BytesIO(response.content)
+            content = fetch_onedrive_file_with_retry(ONEDRIVE_MASTER_URL)
+            fresh_bytes = io.BytesIO(content)
             
             df_sheet1 = pd.read_excel(fresh_bytes, sheet_name="Sheet1", header=None, engine="openpyxl")
             df_coloums = pd.read_excel(fresh_bytes, sheet_name="Coloums", header=None, engine="openpyxl")
