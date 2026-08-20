@@ -439,8 +439,8 @@ def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: s
 
 
 def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
-    """Exact logic from app(2)-old.py, fortified to safely link columns even if the 
-    Excel file contains invisible trailing spaces or underscores."""
+    """Restored from app (2)-old.py with an added fuzzy fallback to ensure mapped 
+    columns like 'Fixed Monthly Gross' never return blank due to hidden Excel spaces."""
     if not letter or df_col_ref is None or df_col_ref.empty:
         return None
     df_col_ref = df_col_ref.copy()
@@ -455,12 +455,12 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
         
-        # 1. Exact match attempt
+        # 1. Exact match (from app (2)-old.py)
         if col_name in row_data:
             val = row_data.get(col_name, "")
             return val if not pd.isna(val) else ""
             
-        # 2. Fuzzy match safety net (ignores hidden Excel spaces)
+        # 2. Fuzzy match safety net (strips hidden spaces/newlines)
         clean_target = re.sub(r"[\s\n_]+", "", str(col_name)).lower()
         for key, value in row_data.items():
             clean_key = re.sub(r"[\s\n_]+", "", str(key)).lower()
@@ -662,7 +662,8 @@ def safe_write(sheet, cell_coordinate: str, value) -> None:
 TEMPLATE_MARKER_FILLS = {"FFBDD6EE", "FFFFFF00", "FF9CC2E5"}
 
 def is_reference_cell(cell) -> bool:
-    """True for cells filled with the template's yellow 'reference/constant' color."""
+    """RESTORED FROM app (2)-old.py
+    Protects original template formulas and constant text like 'NIL'"""
     fill = cell.fill
     if fill and fill.fgColor and fill.fgColor.type == "rgb":
         return fill.fgColor.rgb == "FFFFFF00"
@@ -805,6 +806,7 @@ def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | N
     return None
 
 def _is_numeric_or_formula_value_for_totals(value: object) -> bool:
+    """Helper specifically for the Totals Row functionality."""
     if isinstance(value, bool):
         return False
     if isinstance(value, (int, float)):
@@ -871,6 +873,7 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
     return totals_row_idx
 
 def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int) -> None:
+    """Auto-size every column to its content with a strict minimum of 18."""
     if last_content_row < header_row:
         return
 
@@ -948,6 +951,7 @@ def generate_dynamic_form(
 
     data_col_count = min(sheet.max_column, 51)
 
+    # EXACT REVERT TO app (2)-old.py MAPPING LOOP
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
         row_idx = start_row + offset
@@ -956,6 +960,7 @@ def generate_dynamic_form(
             source_cell = sheet.cell(row=start_row, column=col_idx)
             copy_cell_style(source_cell, target_cell)
 
+            # MANDATORY FIX: Restore `is_reference_cell` skip logic
             if is_reference_cell(source_cell):
                 continue
 
@@ -1338,13 +1343,14 @@ def list_archive_records() -> pd.DataFrame:
                 if not month_dir.is_dir():
                     continue
                 for archive_file in sorted(month_dir.glob("*.xlsx")):
+                    relative_link = f"{STATIC_WEB_PREFIX}/{state_dir.name}/{unit_dir.name}/{month_dir.name}/{archive_file.name}"
                     records.append(
                         {
                             "Form Name": archive_file.stem.replace(f"{state_dir.name}_{unit_dir.name}_", ""),
                             "State / Region": state_dir.name,
                             "Outlet / Brand Unit": unit_dir.name,
                             "Wage Month": month_dir.name,
-                            "File Path": archive_file,
+                            "OneDrive File Link": relative_link,
                         }
                     )
     return pd.DataFrame(records)
