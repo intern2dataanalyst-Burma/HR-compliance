@@ -132,27 +132,16 @@ def fetch_onedrive_file_with_retry(url: str, max_retries: int = 4, delay: int = 
 @st.cache_data(ttl=3600)
 def get_active_master_data():
     if not os.path.exists(MASTER_FILE_PATH):
-        try:
-            os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
-            content = fetch_onedrive_file_with_retry(ONEDRIVE_MASTER_URL)
-            with open(MASTER_FILE_PATH, "wb") as f:
-                f.write(content)
-        except Exception as e:
-            st.error(f"❌ Failed to fetch Master Data from OneDrive (503 / Network Error): {e}")
-            if st.button("🔄 Retry Connection to OneDrive"):
-                st.cache_data.clear()
-                st.rerun()
-            st.stop()
+        os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
+        content = fetch_onedrive_file_with_retry(ONEDRIVE_MASTER_URL)
+        with open(MASTER_FILE_PATH, "wb") as f:
+            f.write(content)
             
-    try:
-        df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
-        df.columns = df.columns.astype(str).str.strip()
-        if "Month-Year" in df.columns:
-            df["Month-Year"] = df["Month-Year"].astype(str).str.strip()
-        return df
-    except Exception as e:
-        st.error(f"❌ Failed to read local Master file: {e}")
-        st.stop()
+    df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
+    df.columns = df.columns.astype(str).str.strip()
+    if "Month-Year" in df.columns:
+        df["Month-Year"] = df["Month-Year"].astype(str).str.strip()
+    return df
 
 
 def email_file_to_outlook(file_bytes, filename):
@@ -1221,7 +1210,14 @@ header_html = """
 st.markdown(header_html, unsafe_allow_html=True)
 
 # Load a cached/simple master view for uploader validation
-df_master = get_active_master_data()
+try:
+    df_master = get_active_master_data()
+except Exception as e:
+    st.error(f"❌ Failed to fetch or read Master Data from OneDrive: {e}")
+    if st.button("🔄 Retry Connection to OneDrive"):
+        st.cache_data.clear()
+        st.rerun()
+    st.stop()
 
 # Sidebar: Update Master Data
 st.sidebar.subheader("📥 Update Master Data")
@@ -1297,8 +1293,6 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
     if missing_cols:
         st.sidebar.error(f"❌ Missing columns: {missing_cols}")
     else:
-        _ = get_active_master_data()
-
         try:
             existing_df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
             existing_df.columns = existing_df.columns.astype(str).str.strip()
@@ -1764,7 +1758,7 @@ with tab2:
                             )
 
 with tab3:
-    st.markdown("### 🚨 Notice Closure Portal")
+    st.markdown("###  Notice Closure Portal")
     st.caption("Securely log compliance notices and view the live dashboard below.")
     
     # Live Google Workspace URL embedded securely into Streamlit
