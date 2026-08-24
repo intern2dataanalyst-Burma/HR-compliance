@@ -66,7 +66,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 
 # Constants for master file sync
 MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.xlsx"
-ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_burmaburma_in/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
+ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
 
 config_dir = BASE_DIR / ".streamlit"
 config_dir.mkdir(parents=True, exist_ok=True)
@@ -682,11 +682,19 @@ def column_letter_to_index(column_letter: str) -> int:
 
 def safe_write(sheet, cell_coordinate: str, value) -> None:
     cell = sheet[cell_coordinate]
+    
+    # Prevent scientific notation (e.g., 1.7991E+15) for large IDs like UAN/Accounts/Signatures
+    is_long_number = value is not None and str(value).strip().isdigit() and len(str(value).strip()) >= 10
+    if is_long_number:
+        cell.number_format = '0'
+        
     if isinstance(cell, MergedCell):
         for merged_range in sheet.merged_cells.ranges:
             if cell_coordinate in merged_range:
                 top_left_coord = merged_range.coord.split(":")[0]
                 sheet[top_left_coord].value = value
+                if is_long_number:
+                    sheet[top_left_coord].number_format = '0'
                 return
     cell.value = value
 
@@ -901,30 +909,56 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
 
     return totals_row_idx
 
-def apply_column_widths(sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int) -> None:
-    if last_content_row < header_row:
+
+def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_col_count: int) -> None:
+    """
+    Dynamically adjusts column widths and row heights based ONLY on the data rows.
+    This prevents ###### errors without destroying the rotated header layouts of Gov forms.
+    """
+    if last_content_row < start_row:
         return
 
     for col_idx in range(1, data_col_count + 1):
         col_letter = get_column_letter(col_idx)
-        max_len = 0
-        any_value = False
+        max_data_len = 0
+        
+        # Scan only the DATA rows to determine required width
+        for row_idx in range(start_row, last_content_row + 1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            
+            # Force wrap text on data cells to allow vertical expansion
+            if cell.alignment:
+                cell.alignment = Alignment(
+                    horizontal=cell.alignment.horizontal,
+                    vertical=cell.alignment.vertical,
+                    wrap_text=True,
+                    text_rotation=cell.alignment.text_rotation
+                )
+            else:
+                cell.alignment = Alignment(wrap_text=True)
 
-        header_cell = sheet.cell(row=header_row, column=col_idx)
-        header_wraps = bool(header_cell.alignment and header_cell.alignment.wrap_text)
+            val = cell.value
+            if val is not None and str(val).strip() != "":
+                # Estimate visual width of the data string
+                lines = str(val).split('\n')
+                longest_line = max(len(line) for line in lines)
+                max_data_len = max(max_data_len, longest_line)
 
-        for row_idx in range(header_row, last_content_row + 1):
-            value = sheet.cell(row=row_idx, column=col_idx).value
-            if value is None or str(value).strip() == "":
-                continue
-            any_value = True
-            if row_idx == header_row and header_wraps:
-                continue
-            text = str(value)
-            max_len = max(max_len, len(text))
+        # Gently adjust column width if the data is wide, capping at 35 so it doesn't stretch infinitely
+        if max_data_len > 0:
+            current_width = sheet.column_dimensions[col_letter].width
+            if current_width is None:
+                current_width = 8.5 # Excel default
+            
+            # If the column is already wider than the data, leave it.
+            # If the data is wider than the column, expand it slightly to prevent ######
+            required_width = max_data_len + 1.2
+            if required_width > current_width:
+                sheet.column_dimensions[col_letter].width = min(required_width, 35)
 
-        if any_value:
-            sheet.column_dimensions[col_letter].width = min(max(max_len + 2, 18), 45)
+    # Allow row heights to auto-fit naturally in Excel for the data rows
+    for row_idx in range(start_row, last_content_row + 1):
+        sheet.row_dimensions[row_idx].height = None
 
 
 def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col_ref, template_bytes):
@@ -1143,22 +1177,9 @@ def generate_dynamic_form(
             sheet.cell(row=reference_row_idx, column=col_idx).value = None
         sheet.row_dimensions[reference_row_idx].hidden = True
 
-    # VISUAL FIX 2: Apply Column Widths
+    # VISUAL FIX 2: Smart Auto-Fit (Prevents ###### without destroying headers)
     last_content_row = totals_row_idx if row_count > 0 else start_row - 1
-    apply_column_widths(sheet, header_row, start_row, last_content_row, data_col_count)
-
-    # VISUAL FIX 3: Strip Background Colors & Reset Text Rotation globally
-    for row_idx in range(1, sheet.max_row + 1):
-        for col_idx in range(1, sheet.max_column + 1):
-            cell = sheet.cell(row=row_idx, column=col_idx)
-            cell.fill = PatternFill(fill_type=None)
-            if cell.alignment and cell.alignment.text_rotation:
-                cell.alignment = Alignment(
-                    horizontal=cell.alignment.horizontal,
-                    vertical=cell.alignment.vertical,
-                    wrap_text=cell.alignment.wrap_text,
-                    text_rotation=0,
-                )
+    apply_smart_formatting(sheet, start_row, last_content_row, data_col_count)
 
     output = BytesIO()
     workbook.save(output)
@@ -1758,7 +1779,7 @@ with tab2:
                             )
 
 with tab3:
-    st.markdown("###  Notice Closure Portal")
+    st.markdown("### 🚨 Notice Closure Portal")
     st.caption("Securely log compliance notices and view the live dashboard below.")
     
     # Live Google Workspace URL embedded securely into Streamlit
