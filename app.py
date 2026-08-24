@@ -66,7 +66,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 
 # Constants for master file sync
 MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.xlsx"
-ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_hungerpangs_onmicrosoft_com/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
+ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_burmaburma_in/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
 
 config_dir = BASE_DIR / ".streamlit"
 config_dir.mkdir(parents=True, exist_ok=True)
@@ -1500,7 +1500,7 @@ def build_archive_zip(file_paths: list[Path]) -> BytesIO:
     return zip_buffer
 
 
-tab1, tab2, tab3 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms", "🚨 Notice Dashboard"])
+tab1, tab2, tab3 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms", "Notice Dashboard"])
 
 with tab1:
     st.markdown("### Selection Filters")
@@ -1779,7 +1779,7 @@ with tab2:
                             )
 
 with tab3:
-    st.markdown("### 🚨 Notice Closure Portal")
+    st.markdown("###  Notice Closure Portal")
     st.caption("Securely log compliance notices and view the live dashboard below.")
     
     # Live Google Workspace URL embedded securely into Streamlit
