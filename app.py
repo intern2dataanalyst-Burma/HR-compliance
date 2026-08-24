@@ -1181,6 +1181,13 @@ def generate_dynamic_form(
     last_content_row = totals_row_idx if row_count > 0 else start_row - 1
     apply_smart_formatting(sheet, start_row, last_content_row, data_col_count)
 
+    # VISUAL FIX 3: Strip Background Colors Only (Preserves Text Rotation!)
+    for row_idx in range(start_row, last_content_row + 1):
+        for col_idx in range(1, data_col_count + 1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            # Remove the yellow/blue highlights
+            cell.fill = PatternFill(fill_type=None)
+
     output = BytesIO()
     workbook.save(output)
     output.seek(0)
