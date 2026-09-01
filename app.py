@@ -461,7 +461,6 @@ def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: s
 
 
 def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
-    """Exact logic from app(2)-old.py restored perfectly to maintain mapping integrity."""
     if not letter or df_col_ref is None or df_col_ref.empty:
         return None
     df_col_ref = df_col_ref.copy()
@@ -599,10 +598,6 @@ def get_value_for_header(
                     values[1], df_col_ref, row, idx, df_units=df_units, selected_unit=selected_unit
                 )
 
-    # ---------------------------------------------------------------------
-    # ULTIMATE FAILSAFE: If Excel Sheet1 rules are empty or fail to read, 
-    # Python forcefully catches the Form E and Form IV headers directly here.
-    # ---------------------------------------------------------------------
     if "wagespayable" in normalized:
         for key in ["Fixed Monthly Gross", "Earned Gross Salary", "Gross Salary", "Net Paid"]:
             if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
@@ -617,7 +612,6 @@ def get_value_for_header(
         for key in ["Total Deductions", "Deduction", "Total Deduction"]:
             if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
                 return row[key]
-    # ---------------------------------------------------------------------
 
     if "code" in normalized:
         return row.get("Code", "")
@@ -682,8 +676,6 @@ def column_letter_to_index(column_letter: str) -> int:
 
 def safe_write(sheet, cell_coordinate: str, value) -> None:
     cell = sheet[cell_coordinate]
-    
-    # Prevent scientific notation (e.g., 1.7991E+15) for large IDs like UAN/Accounts/Signatures
     is_long_number = value is not None and str(value).strip().isdigit() and len(str(value).strip()) >= 10
     if is_long_number:
         cell.number_format = '0'
@@ -911,10 +903,6 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
 
 
 def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_col_count: int) -> None:
-    """
-    Dynamically adjusts column widths and row heights based ONLY on the data rows.
-    This prevents ###### errors without destroying the rotated header layouts of Gov forms.
-    """
     if last_content_row < start_row:
         return
 
@@ -922,11 +910,9 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
         col_letter = get_column_letter(col_idx)
         max_data_len = 0
         
-        # Scan only the DATA rows to determine required width
         for row_idx in range(start_row, last_content_row + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             
-            # Force wrap text on data cells to allow vertical expansion
             if cell.alignment:
                 cell.alignment = Alignment(
                     horizontal=cell.alignment.horizontal,
@@ -939,24 +925,19 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
 
             val = cell.value
             if val is not None and str(val).strip() != "":
-                # Estimate visual width of the data string
                 lines = str(val).split('\n')
                 longest_line = max(len(line) for line in lines)
                 max_data_len = max(max_data_len, longest_line)
 
-        # Gently adjust column width if the data is wide, capping at 35 so it doesn't stretch infinitely
         if max_data_len > 0:
             current_width = sheet.column_dimensions[col_letter].width
             if current_width is None:
-                current_width = 8.5 # Excel default
+                current_width = 8.5
             
-            # If the column is already wider than the data, leave it.
-            # If the data is wider than the column, expand it slightly to prevent ######
             required_width = max_data_len + 1.2
             if required_width > current_width:
                 sheet.column_dimensions[col_letter].width = min(required_width, 35)
 
-    # Allow row heights to auto-fit naturally in Excel for the data rows
     for row_idx in range(start_row, last_content_row + 1):
         sheet.row_dimensions[row_idx].height = None
 
@@ -1307,8 +1288,26 @@ uploaded_file = st.sidebar.file_uploader("Upload Monthly Conso Data (.xlsx)", ty
 if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="primary"):
     try:
         uploaded_bytes = uploaded_file.getbuffer().tobytes()
-        new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl", skiprows=1)
+        
+        # --- SMART HEADER DETECTION FIX ---
+        # 1. Try reading normally first (assuming user uploaded standard headers on Row 1)
+        new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
         new_conso_df.columns = new_conso_df.columns.astype(str).str.strip()
+        
+        # 2. Check for missing columns against the Master Schema
+        missing_normal = set(df_master.columns) - set(new_conso_df.columns)
+        
+        # 3. If significant columns are missing, the file might have a dummy row at the top (like the Master file does)
+        # So we test reading it by skipping the first row
+        if len(missing_normal) > 5:
+            df_skip = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl", skiprows=1)
+            df_skip.columns = df_skip.columns.astype(str).str.strip()
+            missing_skip = set(df_master.columns) - set(df_skip.columns)
+            
+            # If skipping row 1 yields a much better column match, automatically switch to that dataframe!
+            if len(missing_skip) < len(missing_normal):
+                new_conso_df = df_skip
+        # -----------------------------------
 
         new_conso_df["Year"] = int(upload_year)
         new_conso_df["Month-Year"] = f"{upload_month}-{upload_year}"
@@ -1317,6 +1316,7 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         st.sidebar.error(f"❌ Unable to read uploaded file: {e}")
         st.stop()
 
+    # Final definitive check using whichever parsing method worked best
     missing_cols = set(df_master.columns) - set(new_conso_df.columns)
     if missing_cols:
         st.sidebar.error(f"❌ Missing columns: {missing_cols}")
@@ -1637,7 +1637,8 @@ with tab1:
                     st.stop()
                 with st.status("⚡ Generating forms and pushing to cloud OneDrive...", expanded=True) as status:
                     status.write("📄 Compiling statutory form templates...")
-                    all_forms = ["Form A", "Form C", "Form D", "Form E", "Form IV", "Form V"]
+                    state_urls = st.secrets.get("templates", {}).get(selected_state, {})
+                    all_forms = list(state_urls.keys())
                     generated, errors, archive_dir = compile_statutory_forms(
                         all_forms,
                         filtered_df,
