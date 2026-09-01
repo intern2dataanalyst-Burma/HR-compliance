@@ -1637,8 +1637,7 @@ with tab1:
                     st.stop()
                 with st.status("⚡ Generating forms and pushing to cloud OneDrive...", expanded=True) as status:
                     status.write("📄 Compiling statutory form templates...")
-                    state_urls = st.secrets.get("templates", {}).get(selected_state, {})
-                    all_forms = list(state_urls.keys())
+                    all_forms = ["Form A", "Form C", "Form D", "Form E", "Form IV", "Form V"]
                     generated, errors, archive_dir = compile_statutory_forms(
                         all_forms,
                         filtered_df,
