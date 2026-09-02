@@ -285,9 +285,10 @@ def build_merged_view() -> pd.DataFrame:
     df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register = load_master_data()
     df = df_conso.copy()
 
+    conso_code_col = next((c for c in df.columns if "code" in c.lower()), None)
+
     if not df_emp_master.empty and "Unit" in df.columns:
         code_col = next((c for c in df_emp_master.columns if "code" in c.lower()), None)
-        conso_code_col = next((c for c in df.columns if "code" in c.lower()), None)
         if code_col and conso_code_col:
             df = df.merge(
                 df_emp_master.add_suffix("_empmast").rename(columns={f"{code_col}_empmast": code_col}),
@@ -295,6 +296,32 @@ def build_merged_view() -> pd.DataFrame:
                 right_on=code_col,
                 how="left",
                 suffixes=("", "_empmast_dup"),
+            )
+
+    if df_attendance_register is not None and not df_attendance_register.empty:
+        attendance_code_col = next((c for c in df_attendance_register.columns if "code" in c.lower()), None)
+        if attendance_code_col and conso_code_col:
+            df = df.merge(
+                df_attendance_register.add_suffix("_attendance").rename(
+                    columns={f"{attendance_code_col}_attendance": attendance_code_col}
+                ),
+                left_on=conso_code_col,
+                right_on=attendance_code_col,
+                how="left",
+                suffixes=("", "_attendance_dup"),
+            )
+
+    if df_leave_register is not None and not df_leave_register.empty:
+        leave_code_col = next((c for c in df_leave_register.columns if "code" in c.lower()), None)
+        if leave_code_col and conso_code_col:
+            df = df.merge(
+                df_leave_register.add_suffix("_leave").rename(
+                    columns={f"{leave_code_col}_leave": leave_code_col}
+                ),
+                left_on=conso_code_col,
+                right_on=leave_code_col,
+                how="left",
+                suffixes=("", "_leave_dup"),
             )
 
     canonical_columns = {
@@ -332,7 +359,7 @@ def build_merged_view() -> pd.DataFrame:
 
     state_candidate = next((col for col in ["State", "Region", "Location", "State/Region", "State_Region"] if col in df.columns), None)
     if state_candidate is not None:
-        df["State"] = df[state_candidate].astype(str).str.strip()
+        df["State"] = df[state_candidate].fillna("").astype(str).str.strip()
     else:
         df["State"] = pd.Series(["" for _ in range(len(df))])
 
@@ -490,7 +517,7 @@ def _is_col_prefixed(rule_text: str) -> bool:
 def _extract_col_letter(token: str) -> str:
     token = token.strip()
     token = COL_PREFIX_RE.sub("", token)
-    return "".join(ch for ch in token if ch.isalpha()).upper()
+    return "".join(ch for ch in token if ch.isalnum()).upper()
 
 
 def resolve_col_rule(
@@ -615,6 +642,16 @@ def get_value_for_header(
                 
     if "amountdeducted" in normalized:
         for key in ["Total Deductions", "Deduction", "Total Deduction"]:
+            if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
+                return row[key]
+
+    if "lwf" in normalized:
+        for key in ["Employer LWF", "Employee LWF", "LWF Employer", "LWF Employee", "LWF"]:
+            if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
+                return row[key]
+
+    if "overtime" in normalized:
+        for key in ["Overtime", "Over Time", "O_TIME_HRS", "OT_WAGERATE_PERHR"]:
             if key in row and pd.notna(row[key]) and str(row[key]).strip() != "":
                 return row[key]
     # ---------------------------------------------------------------------
@@ -815,6 +852,12 @@ def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year:
         safe_write(sheet, "A4", f"Month Ending -{selected_month.upper()} {year_suffix}")
     elif form_name == "Form V":
         safe_write(sheet, "A5", f"For the period ending - {selected_month}-{selected_year}")
+    elif form_name == "Form IV A":
+        safe_write(sheet, "A4", f"Month Ending -{selected_month.upper()} {year_suffix}")
+    elif form_name == "Form P":
+        safe_write(sheet, "A4", f"For the Month of {selected_month} {selected_year}")
+    elif form_name == "Form M":
+        safe_write(sheet, "A4", f"For the Month of {selected_month} {selected_year}")
 
 
 def verify_generated_form(
@@ -830,7 +873,19 @@ def verify_generated_form(
         return [f"Unable to open generated workbook for QA: {exc}"]
 
     form_key = str(form_name).strip().upper() if form_name else ""
-    start_row = {"FORM A": 19, "FORM C": 9, "FORM D": 8, "FORM E": 9, "FORM IV": 10, "FORM V": 11}.get(form_key, 9)
+    start_row = {
+        "FORM A": 19,
+        "FORM C": 9,
+        "FORM D": 8,
+        "FORM E": 9,
+        "FORM IV": 10,
+        "FORM V": 11,
+        "FORM P": 12,
+        "FORM M": 12,
+        "FORM IV A": 13,
+        "REGISTER OF WAGES-LWF": 11,
+        "REGISTER OF DEDUCTION FORM C": 11,
+    }.get(form_key, 9)
     known_codes = known_codes or set()
 
     for row_idx in range(1, start_row):
@@ -845,8 +900,13 @@ def verify_generated_form(
             elif value.strip() in known_codes:
                 errors.append(f"Leaked employee-code value '{value}' found in header block at row {row_idx}, col {col_idx}")
 
-    name_value = str(sheet.cell(row=start_row, column=3).value or "").strip()
-    if not name_value:
+    name_found = False
+    for col_idx in range(1, 6):
+        candidate_value = str(sheet.cell(row=start_row, column=col_idx).value or "").strip()
+        if candidate_value:
+            name_found = True
+            break
+    if not name_found:
         errors.append(f"Employee Name missing at starting row {start_row}")
 
     for row_idx in range(start_row, min(start_row + 3, sheet.max_row + 1)):
@@ -861,15 +921,18 @@ def verify_generated_form(
     return errors
 
 
-def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | None) -> int | None:
+def find_form_rule_row(df_mapping_rules: pd.DataFrame | None, form_name: str | None, selected_state: str | None) -> int | None:
     if df_mapping_rules is None or df_mapping_rules.empty or form_name is None:
         return None
     if df_mapping_rules.shape[1] < 2:
         return None
     target = str(form_name).strip().upper()
+    target_state = str(selected_state).strip().upper() if selected_state is not None else ""
     for row_idx in range(df_mapping_rules.shape[0]):
         candidate = df_mapping_rules.iloc[row_idx, 1]
-        if pd.notna(candidate) and str(candidate).strip().upper() == target:
+        state_candidate = df_mapping_rules.iloc[row_idx, 0]
+        state_value = str(state_candidate).strip().upper() if pd.notna(state_candidate) else ""
+        if pd.notna(candidate) and str(candidate).strip().upper() == target and state_value == target_state:
             return row_idx
     return None
 
@@ -991,7 +1054,7 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
         sheet.row_dimensions[row_idx].height = None
 
 
-def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col_ref, template_bytes):
+def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col_ref, template_bytes, selected_state=None):
     if filtered_df.empty:
         st.error("No employees found to test mapping.")
         return
@@ -1004,9 +1067,21 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
     header_row = find_header_row(sheet)
     header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 52)]
     
-    FORM_START_ROWS = {"FORM A": 19, "FORM C": 9, "FORM D": 8, "FORM E": 9, "FORM IV": 10, "FORM V": 11}
+    FORM_START_ROWS = {
+        "FORM A": 19,
+        "FORM C": 9,
+        "FORM D": 8,
+        "FORM E": 9,
+        "FORM IV": 10,
+        "FORM V": 11,
+        "FORM P": 12,
+        "FORM M": 12,
+        "FORM IV A": 13,
+        "REGISTER OF WAGES-LWF": 11,
+        "REGISTER OF DEDUCTION FORM C": 11,
+    }
     start_row = FORM_START_ROWS.get(form_name.upper().strip(), 9)
-    form_rule_row = find_form_rule_row(df_mapping_rules, form_name)
+    form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
     
     logs = []
     
@@ -1020,7 +1095,7 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
         
         rule = ""
         if form_rule_row is not None:
-            rule_col_index = col_idx + 7
+            rule_col_index = col_idx + 6
             if rule_col_index < df_mapping_rules.shape[1]:
                 rule_candidate = df_mapping_rules.iloc[form_rule_row, rule_col_index]
                 if pd.notna(rule_candidate):
@@ -1082,6 +1157,7 @@ def generate_dynamic_form(
     selected_month: str,
     selected_year: int,
     form_name: str | None = None,
+    selected_state: str | None = None,
     df_mapping_rules: pd.DataFrame | None = None,
     df_col_ref: pd.DataFrame | None = None,
     df_units: pd.DataFrame | None = None,
@@ -1116,6 +1192,11 @@ def generate_dynamic_form(
         "FORM E": 9,
         "FORM IV": 10,
         "FORM V": 11,
+        "FORM P": 12,
+        "FORM M": 12,
+        "FORM IV A": 13,
+        "REGISTER OF WAGES-LWF": 11,
+        "REGISTER OF DEDUCTION FORM C": 11,
     }
     form_key = str(form_name).strip().upper() if form_name else ""
     start_row = FORM_START_ROWS.get(form_key, 9)
@@ -1125,7 +1206,7 @@ def generate_dynamic_form(
     active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
     month_label = f"{active_month[:3]}-{str(selected_year)[-2:]}"
     wage_month_columns = {"Form E": "E", "Form D": "F"}
-    form_rule_row = find_form_rule_row(df_mapping_rules, form_name)
+    form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
 
     data_col_count = min(sheet.max_column, 51)
 
@@ -1145,7 +1226,7 @@ def generate_dynamic_form(
 
             rule_value = ""
             if df_mapping_rules is not None and not df_mapping_rules.empty and form_rule_row is not None:
-                rule_col_index = col_idx + 7
+                rule_col_index = col_idx + 6
                 if rule_col_index < df_mapping_rules.shape[1]:
                     candidate = df_mapping_rules.iloc[form_rule_row, rule_col_index]
                     if pd.notna(candidate) and str(candidate).strip():
@@ -1200,13 +1281,6 @@ def generate_dynamic_form(
             cell.border = Border()
             cell.font = Font()
             cell.alignment = Alignment()
-
-    # VISUAL FIX 1: Safely Hide Reference Row
-    reference_row_idx = start_row - 1
-    if reference_row_idx >= 1:
-        for col_idx in range(1, sheet.max_column + 1):
-            sheet.cell(row=reference_row_idx, column=col_idx).value = None
-        sheet.row_dimensions[reference_row_idx].hidden = True
 
     # VISUAL FIX 2: Smart Auto-Fit (Prevents ###### without destroying headers)
     last_content_row = totals_row_idx if row_count > 0 else start_row - 1
@@ -1506,6 +1580,7 @@ def compile_statutory_forms(
                 active_month,
                 int(selected_year),
                 form_name=form_name,
+                selected_state=selected_state,
                 df_mapping_rules=df_mapping_rules,
                 df_col_ref=df_col_ref,
                 df_units=df_units,
@@ -1766,7 +1841,8 @@ with tab1:
                     filtered_df, 
                     df_mapping_rules, 
                     df_col_ref, 
-                    template_bytes
+                    template_bytes,
+                    selected_state,
                 )
 
 with tab2:
