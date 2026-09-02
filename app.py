@@ -1629,7 +1629,7 @@ with tab1:
         with gen_col1:
             selected_form = st.selectbox(
                 "Select Statutory Form",
-                ["Form A", "Form C", "Form D", "Form E", "Form IV", "Form V"],
+                available_forms if available_forms else ["None"],
                 key="selected_form",
             )
             if st.button("Generate Selected Form", key="generate_selected"):
