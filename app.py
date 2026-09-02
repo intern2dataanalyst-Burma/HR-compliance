@@ -1338,8 +1338,22 @@ uploaded_file = st.sidebar.file_uploader("Upload Monthly Conso Data (.xlsx)", ty
 if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="primary"):
     try:
         uploaded_bytes = uploaded_file.getbuffer().tobytes()
-        new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl", skiprows=1)
+
+        # --- Smart Header Detector ---
+        new_conso_df = pd.read_excel(io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl")
         new_conso_df.columns = new_conso_df.columns.astype(str).str.strip()
+        missing_cols_normal = set(df_master.columns) - set(new_conso_df.columns)
+
+        if len(missing_cols_normal) > 5:
+            new_conso_df_skip1 = pd.read_excel(
+                io.BytesIO(uploaded_bytes), sheet_name=0, engine="openpyxl", skiprows=1
+            )
+            new_conso_df_skip1.columns = new_conso_df_skip1.columns.astype(str).str.strip()
+            missing_cols_skip1 = set(df_master.columns) - set(new_conso_df_skip1.columns)
+
+            if len(missing_cols_skip1) < len(missing_cols_normal):
+                new_conso_df = new_conso_df_skip1
+        # --- End Smart Header Detector ---
 
         new_conso_df["Year"] = int(upload_year)
         new_conso_df["Month-Year"] = f"{upload_month}-{upload_year}"
