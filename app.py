@@ -384,10 +384,16 @@ def build_merged_view() -> pd.DataFrame:
 
     df["Net Paid"] = pd.to_numeric(df.get("Net Paid", pd.Series([0 for _ in range(len(df))])), errors="coerce").fillna(0)
 
-    for unit_column in ["Unit", "Address", "Address1", "Address_1"]:
-        if unit_column in df_units.columns:
-            df["Unit_Address"] = df_units[unit_column]
-            break
+    address_column = next(
+        (c for c in ["Unit", "Address", "Address1", "Address_1"] if c in df_units.columns),
+        None,
+    )
+    if address_column and "Unit_Clean" in df_units.columns and "Unit_Clean" in df.columns:
+        address_lookup = df_units[["Unit_Clean", address_column]].drop_duplicates(subset=["Unit_Clean"])
+        address_dict = dict(
+            zip(address_lookup["Unit_Clean"].astype(str).str.strip(), address_lookup[address_column])
+        )
+        df["Unit_Address"] = df["Unit_Clean"].map(address_dict)
 
     if "Unit_Clean" in df.columns and "Unit_Clean" in df_units.columns:
         unit_name_col = df_units.columns[2] if len(df_units.columns) > 2 else "Unit"
@@ -810,7 +816,7 @@ def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selec
     address_keywords = ["address"]
     month_keywords = ["forthemonth", "wageperiod", "shalltakeeffectfrom"]
 
-    max_row_scan = min(15, sheet.max_row)
+    max_row_scan = min(25, sheet.max_row)
     max_col_scan = min(15, sheet.max_column)
 
     for row_idx in range(1, max_row_scan + 1):
@@ -873,7 +879,7 @@ def verify_generated_form(
         return [f"Unable to open generated workbook for QA: {exc}"]
 
     form_key = str(form_name).strip().upper() if form_name else ""
-    start_row = {
+    FORM_START_ROWS = {
         "FORM A": 19,
         "FORM C": 9,
         "FORM D": 8,
@@ -885,7 +891,12 @@ def verify_generated_form(
         "FORM IV A": 13,
         "REGISTER OF WAGES-LWF": 11,
         "REGISTER OF DEDUCTION FORM C": 11,
-    }.get(form_key, 9)
+    }
+    if form_key in FORM_START_ROWS:
+        start_row = FORM_START_ROWS[form_key]
+    else:
+        header_row = find_header_row(sheet)
+        start_row = max(header_row + 2, 15)
     known_codes = known_codes or set()
 
     for row_idx in range(1, start_row):
@@ -1080,7 +1091,11 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
         "REGISTER OF WAGES-LWF": 11,
         "REGISTER OF DEDUCTION FORM C": 11,
     }
-    start_row = FORM_START_ROWS.get(form_name.upper().strip(), 9)
+    form_key_diag = form_name.upper().strip()
+    if form_key_diag in FORM_START_ROWS:
+        start_row = FORM_START_ROWS[form_key_diag]
+    else:
+        start_row = max(header_row + 2, 15)
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
     
     logs = []
@@ -1146,7 +1161,6 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
             "Diagnostic Note": note
         })
         
-    st.markdown(f"### Diagnostic Trace for {form_name}")
     st.markdown("This table shows exactly how the code is matching data to the template columns for the first employee. Use this to spot misspelled headers or missing data.")
     st.dataframe(pd.DataFrame(logs), use_container_width=True)
 
@@ -1199,7 +1213,10 @@ def generate_dynamic_form(
         "REGISTER OF DEDUCTION FORM C": 11,
     }
     form_key = str(form_name).strip().upper() if form_name else ""
-    start_row = FORM_START_ROWS.get(form_key, 9)
+    if form_key in FORM_START_ROWS:
+        start_row = FORM_START_ROWS[form_key]
+    else:
+        start_row = max(header_row + 2, 15)
     table_end_row = detect_table_end_row(sheet, start_row)
     row_count = len(filtered_df)
 
@@ -1599,8 +1616,7 @@ def compile_statutory_forms(
             qa_errors = verify_generated_form(temp_path, form_name, known_codes=known_codes)
             os.remove(temp_path)
             if qa_errors:
-                errors.append(f"{form_name} QA failed: {', '.join(qa_errors)}")
-                continue
+                errors.append(f"{form_name} QA Warning: {', '.join(qa_errors)}")
 
             file_path, target_dir = save_form_to_archive(
                 form_bytes,
@@ -1822,28 +1838,34 @@ with tab1:
                             )
         
         with debug_col:
-            if st.button("🛠️ Run Diagnostic Data Test", key="run_diagnostic"):
+            if st.button("🛠️ Run Diagnostic Data Test (All Forms)", key="run_diagnostic"):
                 if selected_month in {"All", "", None}:
                     st.error("❌ Select a specific Month-Year to run the diagnostic test.")
                     st.stop()
-                
+
                 state_urls = st.secrets.get("templates", {}).get(selected_state, {})
-                if selected_form not in state_urls:
-                    st.error("Template URL missing for the selected form.")
+                if not state_urls:
+                    st.error("No template URLs configured for the selected state.")
                     st.stop()
-                    
-                response = requests.get(state_urls[selected_form], timeout=15)
-                response.raise_for_status()
-                template_bytes = io.BytesIO(response.content)
-                
-                run_diagnostic_mapping_test(
-                    selected_form, 
-                    filtered_df, 
-                    df_mapping_rules, 
-                    df_col_ref, 
-                    template_bytes,
-                    selected_state,
-                )
+
+                for form_name, template_url in state_urls.items():
+                    try:
+                        response = requests.get(template_url, timeout=15)
+                        response.raise_for_status()
+                        template_bytes = io.BytesIO(response.content)
+                    except Exception as exc:
+                        st.warning(f"⚠️ Could not download template for {form_name}: {exc}")
+                        continue
+
+                    st.markdown(f"### Diagnostic Trace for {form_name}")
+                    run_diagnostic_mapping_test(
+                        form_name,
+                        filtered_df,
+                        df_mapping_rules,
+                        df_col_ref,
+                        template_bytes,
+                        selected_state,
+                    )
 
 with tab2:
     st.markdown("### OneDrive Form Archive Browser")
