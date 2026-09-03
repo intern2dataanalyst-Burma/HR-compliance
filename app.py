@@ -66,7 +66,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 
 # Constants for master file sync
 MASTER_FILE_PATH = "data/Master_CONSO_DATA_ALL_UNITS.xlsx"
-ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/g/personal/intern2_dataanalyst_burmaburma_in/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
+ONEDRIVE_MASTER_URL = "https://hungerpangs-my.sharepoint.com/:x:/p/intern2_dataanalyst/IQA8NPZyhwnyTo-xjBGG3LdmAUinyrrhOflimsUMPRcYQPs?download=1"
 
 config_dir = BASE_DIR / ".streamlit"
 config_dir.mkdir(parents=True, exist_ok=True)
