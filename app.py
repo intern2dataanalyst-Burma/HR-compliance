@@ -1068,7 +1068,7 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
 def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col_ref, template_bytes, selected_state=None):
     if filtered_df.empty:
         st.error("No employees found to test mapping.")
-        return
+        return None
 
     row = filtered_df.iloc[0].to_dict()
     template_bytes.seek(0)
@@ -1161,8 +1161,10 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
             "Diagnostic Note": note
         })
         
+    logs_df = pd.DataFrame(logs)
     st.markdown("This table shows exactly how the code is matching data to the template columns for the first employee. Use this to spot misspelled headers or missing data.")
-    st.dataframe(pd.DataFrame(logs), use_container_width=True)
+    st.dataframe(logs_df, use_container_width=True)
+    return logs_df
 
 
 def generate_dynamic_form(
@@ -1848,6 +1850,8 @@ with tab1:
                     st.error("No template URLs configured for the selected state.")
                     st.stop()
 
+                diagnostic_frames: dict[str, pd.DataFrame] = {}
+
                 for form_name, template_url in state_urls.items():
                     try:
                         response = requests.get(template_url, timeout=15)
@@ -1858,13 +1862,46 @@ with tab1:
                         continue
 
                     st.markdown(f"### Diagnostic Trace for {form_name}")
-                    run_diagnostic_mapping_test(
+                    logs_df = run_diagnostic_mapping_test(
                         form_name,
                         filtered_df,
                         df_mapping_rules,
                         df_col_ref,
                         template_bytes,
                         selected_state,
+                    )
+                    if logs_df is not None and not logs_df.empty:
+                        diagnostic_frames[form_name] = logs_df
+
+                if diagnostic_frames:
+                    diagnostic_excel = io.BytesIO()
+                    used_sheet_names: set[str] = set()
+                    with pd.ExcelWriter(diagnostic_excel, engine="openpyxl") as writer:
+                        for form_name, logs_df in diagnostic_frames.items():
+                            sheet_name = re.sub(r'[\[\]:*?/\\]', "_", form_name).strip()[:31] or "Diagnostic"
+                            base_sheet_name = sheet_name
+                            suffix = 1
+                            while sheet_name in used_sheet_names:
+                                suffix_str = f"_{suffix}"
+                                sheet_name = f"{base_sheet_name[: 31 - len(suffix_str)]}{suffix_str}"
+                                suffix += 1
+                            used_sheet_names.add(sheet_name)
+                            logs_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    diagnostic_excel.seek(0)
+
+                    active_month_diag = (
+                        selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July"
+                    )
+                    diagnostic_filename = (
+                        f"Diagnostic_{selected_state}_{selected_unit}_"
+                        f"{active_month_diag}-{selected_year}.xlsx"
+                    )
+                    st.download_button(
+                        label="📥 Download Diagnostic Report (All Forms, .xlsx)",
+                        data=diagnostic_excel.getvalue(),
+                        file_name=diagnostic_filename,
+                        mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
+                        key="dl_diagnostic_all_forms",
                     )
 
 with tab2:
