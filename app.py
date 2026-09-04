@@ -385,7 +385,7 @@ def build_merged_view() -> pd.DataFrame:
     df["Net Paid"] = pd.to_numeric(df.get("Net Paid", pd.Series([0 for _ in range(len(df))])), errors="coerce").fillna(0)
 
     address_column = next(
-        (c for c in ["Unit", "Address", "Address1", "Address_1"] if c in df_units.columns),
+        (c for c in ["Address", "Address1", "Address_1"] if c in df_units.columns),
         None,
     )
     if address_column and "Unit_Clean" in df_units.columns and "Unit_Clean" in df.columns:
@@ -517,13 +517,63 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
 
 COL_PREFIX_RE = re.compile(r"^col[\s\-_]+", re.IGNORECASE)
 
+# Physical first-data-row for each (State, Form Name) pair, verified directly against
+# the real uploaded template for each. This MUST be keyed by state as well as form name:
+# multiple states reuse the same form name/number (e.g. "FORM A" exists for both
+# Chandigarh and Gujarat, "Form X"/"Form XI"/"Form XII" exist for both Telangana and
+# West Bengal) with genuinely different physical row layouts. A flat form-name-only
+# dict silently collides across states -- this was confirmed to have caused Gujarat's
+# FORM A, Form M, and Form IV A to use Chandigarh/placeholder row numbers instead of
+# their own verified ones.
+FORM_START_ROWS_BY_STATE = {
+    ("CHANDIGARH", "FORM A"): 19,
+    ("CHANDIGARH", "FORM C"): 9,
+    ("CHANDIGARH", "FORM D"): 8,
+    ("CHANDIGARH", "FORM E"): 9,
+    ("CHANDIGARH", "FORM IV"): 10,
+    ("CHANDIGARH", "FORM V"): 11,
+    ("GUJARAT", "FORM A"): 9,
+    ("GUJARAT", "FORM P"): 12,
+    ("GUJARAT", "FORM M"): 14,
+    ("GUJARAT", "FORM IV A"): 10,
+    ("GUJARAT", "REGISTER OF DEDUCTION FORM C"): 11,
+    ("TELANGANA", "FORM X"): 7,
+    ("TELANGANA", "FORM XI"): 8,
+    ("TELANGANA", "FORM XII"): 6,
+    ("TELANGANA", "FORM XXII"): 10,
+    ("TELANGANA", "FORM XXIII"): 9,
+    ("TELANGANA", "FORM XXV"): 10,
+    ("TELANGANA", "FORM III"): 11,
+    ("WEST BENGAL", "FORM D"): 9,
+    ("WEST BENGAL", "FORM G"): 10,
+    ("WEST BENGAL", "FORM H"): 10,
+    ("WEST BENGAL", "FORM J"): 9,
+    ("WEST BENGAL", "FORM M"): 10,
+    ("WEST BENGAL", "FORM U"): 10,
+    ("WEST BENGAL", "FORM V"): 8,
+    ("WEST BENGAL", "FORM W"): 11,
+    ("WEST BENGAL", "FORM X"): 8,
+    ("WEST BENGAL", "FORM XI"): 8,
+    ("WEST BENGAL", "FORM XII"): 7,
+    ("WEST BENGAL", "FORM XIV"): 10,
+    ("WEST BENGAL", "FORM XVII"): 9,
+}
+
+
+def get_form_start_row(selected_state: str | None, form_name: str | None, default: int = 9) -> int:
+    state_key = str(selected_state).strip().upper() if selected_state else ""
+    form_key = str(form_name).strip().upper() if form_name else ""
+    return FORM_START_ROWS_BY_STATE.get((state_key, form_key), default)
+
+
 def _is_col_prefixed(rule_text: str) -> bool:
     return bool(COL_PREFIX_RE.match(rule_text.strip()))
 
 def _extract_col_letter(token: str) -> str:
     token = token.strip()
     token = COL_PREFIX_RE.sub("", token)
-    return "".join(ch for ch in token if ch.isalnum()).upper()
+    match = re.match(r"[A-Za-z0-9]+", token)
+    return match.group(0).upper() if match else ""
 
 
 def resolve_col_rule(
@@ -723,21 +773,65 @@ def column_letter_to_index(column_letter: str) -> int:
     return total
 
 
+def _coerce_numeric_for_write(value):
+    """Turn numeric-looking values into real int/float so Excel treats them as
+    numbers instead of text, and whole numbers display cleanly (no trailing
+    '.0'). Leaves genuinely non-numeric text and leading-zero codes untouched,
+    since those must stay text (e.g. an employee code '0102')."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return value
+        unsigned = stripped[1:] if stripped.startswith("-") else stripped
+        if re.fullmatch(r"\d+", unsigned) and not unsigned.startswith("0"):
+            try:
+                return int(stripped)
+            except ValueError:
+                return value
+        if re.fullmatch(r"\d+\.\d+", unsigned):
+            try:
+                as_float = float(stripped)
+                return int(as_float) if as_float.is_integer() else as_float
+            except ValueError:
+                return value
+        return value
+    # numpy int64/float64 and similar numeric-but-not-Python-native types
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        return value
+    return int(as_float) if as_float.is_integer() else as_float
+
+
 def safe_write(sheet, cell_coordinate: str, value) -> None:
     cell = sheet[cell_coordinate]
-    
-    # Prevent scientific notation (e.g., 1.7991E+15) for large IDs like UAN/Accounts/Signatures
-    is_long_number = value is not None and str(value).strip().isdigit() and len(str(value).strip()) >= 10
-    if is_long_number:
+    value = _coerce_numeric_for_write(value)
+
+    # Prevent scientific notation (e.g., 1.7991E+15) for large IDs like UAN/Accounts/Signatures,
+    # and give whole numbers a clean '0' display format (no decimals, no thousands separator,
+    # so a narrow column shows the real digits instead of "##").
+    is_whole_number = isinstance(value, int) and not isinstance(value, bool)
+    is_long_number = value is not None and str(value).strip().lstrip('-').isdigit() and len(str(value).strip().lstrip('-')) >= 10
+    if is_whole_number or is_long_number:
         cell.number_format = '0'
-        
+    elif isinstance(value, float):
+        cell.number_format = '0.##'
+
     if isinstance(cell, MergedCell):
         for merged_range in sheet.merged_cells.ranges:
             if cell_coordinate in merged_range:
                 top_left_coord = merged_range.coord.split(":")[0]
                 sheet[top_left_coord].value = value
-                if is_long_number:
+                if is_whole_number or is_long_number:
                     sheet[top_left_coord].number_format = '0'
+                elif isinstance(value, float):
+                    sheet[top_left_coord].number_format = '0.##'
                 return
     cell.value = value
 
@@ -751,6 +845,14 @@ def is_reference_cell(cell) -> bool:
     return False
 
 def detect_table_end_row(sheet, start_row: int, max_scan: int = 500) -> int:
+    for row_idx in range(start_row, start_row + max_scan):
+        if row_idx > sheet.max_row:
+            break
+        for col_idx in range(1, 11):
+            value = sheet.cell(row=row_idx, column=col_idx).value
+            if value is not None and "TOTAL" in str(value).strip().upper():
+                return row_idx
+
     last_marked_row = start_row
     blank_streak = 0
     for row_idx in range(start_row, start_row + max_scan):
@@ -870,6 +972,7 @@ def verify_generated_form(
     file_path: str | os.PathLike[str],
     form_name: str | None = None,
     known_codes: set[str] | None = None,
+    selected_state: str | None = None,
 ) -> list[str]:
     errors: list[str] = []
     try:
@@ -878,25 +981,7 @@ def verify_generated_form(
     except Exception as exc:
         return [f"Unable to open generated workbook for QA: {exc}"]
 
-    form_key = str(form_name).strip().upper() if form_name else ""
-    FORM_START_ROWS = {
-        "FORM A": 19,
-        "FORM C": 9,
-        "FORM D": 8,
-        "FORM E": 9,
-        "FORM IV": 10,
-        "FORM V": 11,
-        "FORM P": 12,
-        "FORM M": 12,
-        "FORM IV A": 13,
-        "REGISTER OF WAGES-LWF": 11,
-        "REGISTER OF DEDUCTION FORM C": 11,
-    }
-    if form_key in FORM_START_ROWS:
-        start_row = FORM_START_ROWS[form_key]
-    else:
-        header_row = find_header_row(sheet)
-        start_row = max(header_row + 2, 15)
+    start_row = get_form_start_row(selected_state, form_name, default=15)
     known_codes = known_codes or set()
 
     for row_idx in range(1, start_row):
@@ -1078,24 +1163,7 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
     header_row = find_header_row(sheet)
     header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 52)]
     
-    FORM_START_ROWS = {
-        "FORM A": 19,
-        "FORM C": 9,
-        "FORM D": 8,
-        "FORM E": 9,
-        "FORM IV": 10,
-        "FORM V": 11,
-        "FORM P": 12,
-        "FORM M": 12,
-        "FORM IV A": 13,
-        "REGISTER OF WAGES-LWF": 11,
-        "REGISTER OF DEDUCTION FORM C": 11,
-    }
-    form_key_diag = form_name.upper().strip()
-    if form_key_diag in FORM_START_ROWS:
-        start_row = FORM_START_ROWS[form_key_diag]
-    else:
-        start_row = max(header_row + 2, 15)
+    start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
     
     logs = []
@@ -1128,23 +1196,25 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
             extracted_value = "[SKIPPED: TEMPLATE FORMULA]"
             note = f"Protected template constant: {source_cell.value}"
         elif _is_col_prefixed(rule):
-            letter = _extract_col_letter(rule)
-            lookup = df_col_ref.iloc[:, 0].astype(str).str.strip().str.upper()
-            values = df_col_ref.iloc[:, 1].astype(str).str.strip()
-            match_idx = lookup[lookup == letter].index
-            
-            if len(match_idx) > 0:
-                mapped_target = values.iloc[match_idx[0]]
-                if mapped_target in row:
-                    val = row.get(mapped_target, "")
-                    extracted_value = str(val) if not pd.isna(val) else ""
-                    note = "✅ Exact match successful"
-                else:
-                    extracted_value = "BLANK"
-                    close_keys = [k for k in row.keys() if 'Gross' in str(k) or 'Wage' in str(k) or 'Earn' in str(k)]
-                    note = f"❌ TARGET '{mapped_target}' NOT FOUND. Similar keys in data: {close_keys}"
+            if "+" in rule:
+                sub_letters = [_extract_col_letter(part) for part in rule.split("+")]
+                mapped_target = " + ".join(sub_letters)
             else:
-                note = f"❌ Rule letter {letter} not found in Coloums mapping sheet!"
+                sub_letters = [_extract_col_letter(rule)]
+                mapped_target = sub_letters[0]
+
+            lookup = df_col_ref.iloc[:, 0].astype(str).str.strip().str.upper()
+            missing_letters = [l for l in sub_letters if l not in set(lookup)]
+
+            resolved_value = resolve_col_rule(rule, df_col_ref, row, 0)
+            if resolved_value not in (None, ""):
+                extracted_value = str(resolved_value)
+                note = "✅ Exact match successful"
+            elif missing_letters:
+                note = f"❌ Rule letter(s) {', '.join(missing_letters)} not found in Coloums mapping sheet!"
+            else:
+                extracted_value = "BLANK"
+                note = f"❌ TARGET '{mapped_target}' resolved but this employee's data is blank for it."
         elif rule:
             extracted_value = "..."
             note = f"Evaluated via manual rule: {rule}"
@@ -1201,24 +1271,8 @@ def generate_dynamic_form(
     header_row = find_header_row(sheet)
     header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 51)]
 
-    FORM_START_ROWS = {
-        "FORM A": 19,
-        "FORM C": 9,
-        "FORM D": 8,
-        "FORM E": 9,
-        "FORM IV": 10,
-        "FORM V": 11,
-        "FORM P": 12,
-        "FORM M": 12,
-        "FORM IV A": 13,
-        "REGISTER OF WAGES-LWF": 11,
-        "REGISTER OF DEDUCTION FORM C": 11,
-    }
     form_key = str(form_name).strip().upper() if form_name else ""
-    if form_key in FORM_START_ROWS:
-        start_row = FORM_START_ROWS[form_key]
-    else:
-        start_row = max(header_row + 2, 15)
+    start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
     table_end_row = detect_table_end_row(sheet, start_row)
     row_count = len(filtered_df)
 
@@ -1292,14 +1346,9 @@ def generate_dynamic_form(
 
     # Clear remaining unused template rows inside the blue/yellow boundary (Leaves footers untouched)
     clear_start_row = totals_row_idx + 1
-    for row_idx in range(clear_start_row, table_end_row + 1):
-        for col_idx in range(1, sheet.max_column + 1):
-            cell = sheet.cell(row=row_idx, column=col_idx)
-            safe_write(sheet, cell.coordinate, None)
-            cell.fill = PatternFill(fill_type=None)
-            cell.border = Border()
-            cell.font = Font()
-            cell.alignment = Alignment()
+    if table_end_row >= clear_start_row:
+        amount_to_delete = table_end_row - clear_start_row + 1
+        sheet.delete_rows(clear_start_row, amount_to_delete)
 
     # VISUAL FIX 2: Smart Auto-Fit (Prevents ###### without destroying headers)
     last_content_row = totals_row_idx if row_count > 0 else start_row - 1
@@ -1615,7 +1664,7 @@ def compile_statutory_forms(
                 for c in filtered_df.get("Code", pd.Series(dtype=str)).tolist()
                 if str(c).strip()
             }
-            qa_errors = verify_generated_form(temp_path, form_name, known_codes=known_codes)
+            qa_errors = verify_generated_form(temp_path, form_name, known_codes=known_codes, selected_state=selected_state)
             os.remove(temp_path)
             if qa_errors:
                 errors.append(f"{form_name} QA Warning: {', '.join(qa_errors)}")
