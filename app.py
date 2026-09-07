@@ -599,7 +599,7 @@ def resolve_col_rule(
         cleaned = re.sub(r"[\(\-]?\s*fixed\s*text\s*\)?", "", rule_text, flags=re.IGNORECASE)
         return cleaned.strip(" -")
 
-    if lowered_rule == "auto_generated":
+    if lowered_rule == "auto_generated" or lowered_rule.startswith("auto"):
         return idx + 1
 
     if lowered_rule == "wage month":
@@ -1216,7 +1216,8 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
                 extracted_value = "BLANK"
                 note = f"❌ TARGET '{mapped_target}' resolved but this employee's data is blank for it."
         elif rule:
-            extracted_value = "..."
+            resolved_value = resolve_col_rule(rule, df_col_ref, row, 0)
+            extracted_value = str(resolved_value) if resolved_value not in (None, "") else "BLANK"
             note = f"Evaluated via manual rule: {rule}"
         else:
             extracted_value = "..."
