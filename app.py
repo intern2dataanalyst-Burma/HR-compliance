@@ -268,11 +268,24 @@ def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
             df_units["Unit_Clean"] = ""
 
         if "Unit_Clean" in df_conso.columns and "Unit_Clean" in df_units.columns:
-            state_lookup = df_units[["Unit_Clean", "State"]].drop_duplicates(subset=["Unit_Clean"])
-            df_conso = df_conso.merge(state_lookup, on="Unit_Clean", how="left", suffixes=("", "_master"))
-            if "State_master" in df_conso.columns:
-                df_conso["State"] = df_conso["State"].fillna(df_conso["State_master"])
-                df_conso.drop(columns=["State_master"], inplace=True)
+            units_state_col = next(
+                (c for c in ["State", "STATE", "State/Region", "Region"] if c in df_units.columns),
+                None,
+            )
+            if units_state_col is not None:
+                state_lookup = df_units[["Unit_Clean", units_state_col]].drop_duplicates(subset=["Unit_Clean"])
+                if units_state_col != "State":
+                    state_lookup = state_lookup.rename(columns={units_state_col: "State"})
+                df_conso = df_conso.merge(state_lookup, on="Unit_Clean", how="left", suffixes=("", "_master"))
+                if "State_master" in df_conso.columns:
+                    df_conso["State"] = df_conso["State"].fillna(df_conso["State_master"])
+                    df_conso.drop(columns=["State_master"], inplace=True)
+            else:
+                st.warning(
+                    "Units_Master has no 'State' column, so outlets could not be matched to a "
+                    "State this run. State-based filtering and form generation may be incomplete "
+                    "until the 'State' column is restored."
+                )
 
         return df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register
     except Exception as exc:
