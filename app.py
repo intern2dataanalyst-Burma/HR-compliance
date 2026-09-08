@@ -536,7 +536,7 @@ FORM_START_ROWS_BY_STATE = {
     ("GUJARAT", "FORM P"): 12,
     ("GUJARAT", "FORM M"): 14,
     ("GUJARAT", "FORM IV A"): 10,
-    ("GUJARAT", "REGISTER OF DEDUCTION FORM C"): 11,
+    ("GUJARAT", "FORM C"): 12,
     ("TELANGANA", "FORM X"): 7,
     ("TELANGANA", "FORM XI"): 8,
     ("TELANGANA", "FORM XII"): 6,
@@ -544,19 +544,12 @@ FORM_START_ROWS_BY_STATE = {
     ("TELANGANA", "FORM XXIII"): 9,
     ("TELANGANA", "FORM XXV"): 10,
     ("TELANGANA", "FORM III"): 11,
-    ("WEST BENGAL", "FORM D"): 9,
-    ("WEST BENGAL", "FORM G"): 10,
-    ("WEST BENGAL", "FORM H"): 10,
     ("WEST BENGAL", "FORM J"): 9,
     ("WEST BENGAL", "FORM M"): 10,
     ("WEST BENGAL", "FORM U"): 10,
-    ("WEST BENGAL", "FORM V"): 8,
-    ("WEST BENGAL", "FORM W"): 11,
     ("WEST BENGAL", "FORM X"): 8,
     ("WEST BENGAL", "FORM XI"): 8,
     ("WEST BENGAL", "FORM XII"): 7,
-    ("WEST BENGAL", "FORM XIV"): 10,
-    ("WEST BENGAL", "FORM XVII"): 9,
 }
 
 
@@ -576,6 +569,17 @@ def _extract_col_letter(token: str) -> str:
     return match.group(0).upper() if match else ""
 
 
+EMBEDDED_COL_REF_RE = re.compile(r"\{\s*col[\s\-_]*([a-zA-Z0-9]+)\s*\}", re.IGNORECASE)
+
+
+def _substitute_embedded_col_refs(text: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> str:
+    def _replace(match: re.Match) -> str:
+        letter = match.group(1).upper()
+        value = _lookup_col_ref_value(letter, df_col_ref, row_data)
+        return "" if value in (None, "") else str(value)
+    return EMBEDDED_COL_REF_RE.sub(_replace, text)
+
+
 def resolve_col_rule(
     rule_str: object,
     df_col_ref: pd.DataFrame | None,
@@ -592,6 +596,9 @@ def resolve_col_rule(
     rule_text = str(rule_str).strip()
     if not rule_text:
         return ""
+
+    if EMBEDDED_COL_REF_RE.search(rule_text):
+        rule_text = _substitute_embedded_col_refs(rule_text, df_col_ref, row_data)
 
     lowered_rule = rule_text.lower()
 
@@ -884,6 +891,9 @@ def copy_cell_style(source_cell, target_cell) -> None:
         target_cell.alignment = copy(source_cell.alignment)
 
 
+MONTH_NAME_ALTERNATION = r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+DATE_IN_TEXT_RE = re.compile(MONTH_NAME_ALTERNATION + r"[\s\-]*\d{2,4}", re.IGNORECASE)
+
 def write_header_month(sheet, selected_month: str, selected_year: int | None = None) -> None:
     target_keywords = ["month", "for the period ending", "wage month", "period"]
     if selected_month in {"All", "", None}:
@@ -892,18 +902,26 @@ def write_header_month(sheet, selected_month: str, selected_year: int | None = N
         selected_year = datetime.now().year
 
     month_label = f"{selected_month}-{str(selected_year)[-2:]}"
-    for row_idx in range(1, 6):
+    for row_idx in range(1, 10):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             if cell.value is None:
                 continue
             normalized_value = normalize_header(cell.value)
             if any(keyword in normalized_value for keyword in target_keywords):
-                next_cell = sheet.cell(row=row_idx, column=col_idx + 1)
-                if next_cell.value is None or normalize_header(str(next_cell.value)) != normalize_header(month_label):
-                    safe_write(sheet, next_cell.coordinate, month_label)
+                current_text = str(cell.value)
+                existing_date_match = DATE_IN_TEXT_RE.search(current_text)
+                if existing_date_match:
+                    # Replace the stale month/year already embedded in this cell's own text,
+                    # instead of writing into a neighboring cell and leaving the old date behind.
+                    new_text = current_text[: existing_date_match.start()] + month_label
+                    safe_write(sheet, cell.coordinate, new_text)
                 else:
-                    safe_write(sheet, cell.coordinate, month_label)
+                    next_cell = sheet.cell(row=row_idx, column=col_idx + 1)
+                    if next_cell.value is None or normalize_header(str(next_cell.value)) != normalize_header(month_label):
+                        safe_write(sheet, next_cell.coordinate, month_label)
+                    else:
+                        safe_write(sheet, cell.coordinate, month_label)
                 return
 
 
@@ -960,12 +978,6 @@ def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year:
         safe_write(sheet, "A4", f"Month Ending -{selected_month.upper()} {year_suffix}")
     elif form_name == "Form V":
         safe_write(sheet, "A5", f"For the period ending - {selected_month}-{selected_year}")
-    elif form_name == "Form IV A":
-        safe_write(sheet, "A4", f"Month Ending -{selected_month.upper()} {year_suffix}")
-    elif form_name == "Form P":
-        safe_write(sheet, "A4", f"For the Month of {selected_month} {selected_year}")
-    elif form_name == "Form M":
-        safe_write(sheet, "A4", f"For the Month of {selected_month} {selected_year}")
 
 
 def verify_generated_form(
@@ -1052,7 +1064,7 @@ def _is_numeric_or_formula_value_for_totals(value: object) -> bool:
 NON_SUMMABLE_HEADER_TOKENS = {
     "signature", "account", "aadhar", "aadhaar", "pan", "uan", "regn",
     "registration", "licence", "license", "mobile", "phone", "ward", "circle",
-    "number",
+    "number", "code", "serial",
 }
 
 def _is_identifier_header(header_value: object) -> bool:
@@ -1103,18 +1115,23 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
     """
     Dynamically adjusts column widths and row heights based ONLY on the data rows.
     This prevents ###### errors without destroying the rotated header layouts of Gov forms.
+    Also normalizes font weight and computes an explicit fallback row height, since not
+    every spreadsheet application (Google Sheets, LibreOffice) auto-calculates wrapped-text
+    row height the way Excel does when height is left as None.
     """
     if last_content_row < start_row:
         return
 
+    column_widths: dict[int, float] = {}
+
     for col_idx in range(1, data_col_count + 1):
         col_letter = get_column_letter(col_idx)
         max_data_len = 0
-        
+
         # Scan only the DATA rows to determine required width
         for row_idx in range(start_row, last_content_row + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
-            
+
             # Force wrap text on data cells to allow vertical expansion
             if cell.alignment:
                 cell.alignment = Alignment(
@@ -1126,6 +1143,19 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
             else:
                 cell.alignment = Alignment(wrap_text=True)
 
+            # Normalize font weight so a data row can't inherit stray bold/non-bold
+            # inconsistency from whichever column happened to be used as the style
+            # reference. Data rows are always regular weight; the totals row is
+            # bolded separately by write_totals_row, which runs after this.
+            if cell.font:
+                cell.font = Font(
+                    name=cell.font.name,
+                    size=cell.font.size,
+                    bold=False,
+                    italic=cell.font.italic,
+                    color=cell.font.color,
+                )
+
             val = cell.value
             if val is not None and str(val).strip() != "":
                 # Estimate visual width of the data string
@@ -1134,20 +1164,31 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
                 max_data_len = max(max_data_len, longest_line)
 
         # Gently adjust column width if the data is wide, capping at 35 so it doesn't stretch infinitely
+        current_width = sheet.column_dimensions[col_letter].width
+        if current_width is None:
+            current_width = 8.5  # Excel default
         if max_data_len > 0:
-            current_width = sheet.column_dimensions[col_letter].width
-            if current_width is None:
-                current_width = 8.5 # Excel default
-            
-            # If the column is already wider than the data, leave it.
-            # If the data is wider than the column, expand it slightly to prevent ######
             required_width = max_data_len + 1.2
             if required_width > current_width:
-                sheet.column_dimensions[col_letter].width = min(required_width, 35)
+                current_width = min(required_width, 35)
+                sheet.column_dimensions[col_letter].width = current_width
+        column_widths[col_idx] = current_width
 
-    # Allow row heights to auto-fit naturally in Excel for the data rows
+    # Row height: let Excel auto-fit where it can (height=None), but also compute an
+    # explicit fallback so wrapped multi-line text still displays correctly in viewers
+    # that don't recalculate wrapped-row height on open.
     for row_idx in range(start_row, last_content_row + 1):
-        sheet.row_dimensions[row_idx].height = None
+        max_lines_needed = 1
+        for col_idx in range(1, data_col_count + 1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            val = cell.value
+            if val is None or str(val).strip() == "":
+                continue
+            width = max(column_widths.get(col_idx, 8.5), 1)
+            for line in str(val).split('\n'):
+                lines_needed = max(1, -(-len(line) // int(width)))  # ceiling division
+                max_lines_needed = max(max_lines_needed, lines_needed)
+        sheet.row_dimensions[row_idx].height = max(15, max_lines_needed * 15)
 
 
 def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col_ref, template_bytes, selected_state=None):
