@@ -214,6 +214,7 @@ def normalize_unit_key(value: object) -> str:
     return re.sub(r"[\s\-_]+", "", str(value)).strip().lower()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     try:
         if Path(MASTER_FILE_PATH).exists():
