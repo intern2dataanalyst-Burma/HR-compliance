@@ -547,7 +547,7 @@ FORM_START_ROWS_BY_STATE = {
     ("CHANDIGARH", "FORM IV"): 10,
     ("CHANDIGARH", "FORM V"): 11,
     ("GUJARAT", "FORM A"): 9,
-    ("GUJARAT", "FORM P"): 12,
+    ("GUJARAT", "FORM P"): 13,
     ("GUJARAT", "FORM M"): 14,
     ("GUJARAT", "FORM IV A"): 10,
     ("GUJARAT", "FORM C"): 12,
@@ -908,6 +908,12 @@ def copy_cell_style(source_cell, target_cell) -> None:
 MONTH_NAME_ALTERNATION = r"(January|February|March|April|May|June|July|August|September|October|November|December)"
 DATE_IN_TEXT_RE = re.compile(MONTH_NAME_ALTERNATION + r"[\s\-]*\d{2,4}", re.IGNORECASE)
 
+MONTH_NAMES_LOWER = {
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+}
+
+
 def write_header_month(sheet, selected_month: str, selected_year: int | None = None) -> None:
     target_keywords = ["month", "for the period ending", "wage month", "period"]
     if selected_month in {"All", "", None}:
@@ -930,12 +936,43 @@ def write_header_month(sheet, selected_month: str, selected_year: int | None = N
                     # instead of writing into a neighboring cell and leaving the old date behind.
                     new_text = current_text[: existing_date_match.start()] + month_label
                     safe_write(sheet, cell.coordinate, new_text)
+                    return
+
+                # Some templates split the label and its value across several non-adjacent
+                # cells in the same row (e.g. "For the month of:" ... "June" ... "Year" "2026").
+                # Scan forward for an existing month-name cell (and a separate year cell after
+                # it) before falling back to the naive "write into the very next cell" behavior.
+                replaced = False
+                for lookahead in range(1, 8):
+                    probe_col = col_idx + lookahead
+                    if probe_col > sheet.max_column:
+                        break
+                    probe_cell = sheet.cell(row=row_idx, column=probe_col)
+                    probe_text = str(probe_cell.value or "").strip()
+                    if not probe_text:
+                        continue
+                    probe_key = probe_text.lower().rstrip(".").strip()
+                    if probe_key in MONTH_NAMES_LOWER or DATE_IN_TEXT_RE.search(probe_text):
+                        safe_write(sheet, probe_cell.coordinate, selected_month)
+                        for year_lookahead in range(1, 5):
+                            year_col = probe_col + year_lookahead
+                            if year_col > sheet.max_column:
+                                break
+                            year_cell = sheet.cell(row=row_idx, column=year_col)
+                            year_text = str(year_cell.value or "").strip()
+                            if re.fullmatch(r"\d{4}(\.0)?", year_text):
+                                safe_write(sheet, year_cell.coordinate, selected_year)
+                                break
+                        replaced = True
+                        break
+                if replaced:
+                    return
+
+                next_cell = sheet.cell(row=row_idx, column=col_idx + 1)
+                if next_cell.value is None or normalize_header(str(next_cell.value)) != normalize_header(month_label):
+                    safe_write(sheet, next_cell.coordinate, month_label)
                 else:
-                    next_cell = sheet.cell(row=row_idx, column=col_idx + 1)
-                    if next_cell.value is None or normalize_header(str(next_cell.value)) != normalize_header(month_label):
-                        safe_write(sheet, next_cell.coordinate, month_label)
-                    else:
-                        safe_write(sheet, cell.coordinate, month_label)
+                    safe_write(sheet, cell.coordinate, month_label)
                 return
 
 
