@@ -508,24 +508,32 @@ def get_unit_master_column_value(df_units: pd.DataFrame | None, selected_unit: s
 
 
 def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
-    """Exact logic from app(2)-old.py restored perfectly to maintain mapping integrity."""
+    """Look up a Coloums registry entry by its short code (e.g. 'B', 'AT1', 'EN') and
+    return the matching field's value from the current employee row. Matching is
+    tolerant of stray whitespace, hyphens, and underscores in the registry's own code
+    column, since Sheet1/Coloums entries have been hand-edited with inconsistent
+    formatting throughout this project (e.g. 'AT-1' vs 'AT_1' vs 'AT1')."""
     if not letter or df_col_ref is None or df_col_ref.empty:
         return None
     df_col_ref = df_col_ref.copy()
     df_col_ref.columns = df_col_ref.columns.astype(str).str.strip()
     if len(df_col_ref.columns) < 2:
         return None
-    
-    lookup = df_col_ref.iloc[:, 0].astype(str).str.strip().str.upper()
+
+    def _clean_code(value: object) -> str:
+        return re.sub(r"[\s\-_]+", "", str(value)).strip().upper()
+
+    target = _clean_code(letter)
+    lookup = df_col_ref.iloc[:, 0].apply(_clean_code)
     values = df_col_ref.iloc[:, 1].astype(str).str.strip()
-    match_idx = lookup[lookup == letter].index
-    
+    match_idx = lookup[lookup == target].index
+
     if len(match_idx) > 0:
         col_name = values.iloc[match_idx[0]]
         if col_name in row_data:
             val = row_data.get(col_name, "")
             return val if not pd.isna(val) else ""
-            
+
     return None
 
 
@@ -546,7 +554,7 @@ FORM_START_ROWS_BY_STATE = {
     ("CHANDIGARH", "FORM E"): 9,
     ("CHANDIGARH", "FORM IV"): 10,
     ("CHANDIGARH", "FORM V"): 11,
-    ("GUJARAT", "FORM A"): 9,
+    ("GUJARAT", "FORM A"): 10,
     ("GUJARAT", "FORM P"): 13,
     ("GUJARAT", "FORM M"): 14,
     ("GUJARAT", "FORM IV A"): 10,
@@ -571,6 +579,55 @@ def get_form_start_row(selected_state: str | None, form_name: str | None, defaul
     state_key = str(selected_state).strip().upper() if selected_state else ""
     form_key = str(form_name).strip().upper() if form_name else ""
     return FORM_START_ROWS_BY_STATE.get((state_key, form_key), default)
+
+
+def _looks_like_numbering_row(sheet, row_idx: int, max_col_scan: int = 5) -> bool:
+    """Detect a legend/numbering row (e.g. '1','2','3'... or 'Sr. No.') sitting at
+    start_row, so employee data never gets pasted directly on top of it. A genuine
+    legend row is purely small sequential numeric markers with no real text -- if
+    any of the first few columns holds actual text (an employee name, a real
+    multi-digit code, etc.), this bails out immediately and treats it as real data,
+    not a legend, to avoid ever skipping a genuine first employee row."""
+    numeric_hits = 0
+    label_hits = 0
+    for col_idx in range(1, max_col_scan + 1):
+        val = sheet.cell(row=row_idx, column=col_idx).value
+        if val is None:
+            continue
+        text = str(val).strip()
+        if not text:
+            continue
+        normalized = normalize_header(text)
+        if normalized in ("srno", "slno", "sino", "serialno"):
+            label_hits += 1
+            continue
+        if re.fullmatch(r"\d{1,2}(\.0)?", text):
+            numeric_hits += 1
+            continue
+        return False
+    return (numeric_hits + label_hits) >= 2
+
+
+INTERNAL_ANNOTATION_PATTERNS = ["salreg", "empmast", "emplmast", "empmaster", "salaryreg"]
+
+
+def _clear_internal_annotation_row(sheet, row_idx: int, max_col_scan: int = 60) -> None:
+    """Clear cells containing known internal build-note annotations (like 'Sal Reg' or
+    'Emp Mast' -- leftover data-source notes from template construction) without
+    touching genuine statutory sub-headers or numbering legends that might share the
+    same row. Deliberately does NOT blank the whole row -- only cells whose text
+    matches one of these specific known junk patterns, unlike the old blanket
+    reference-row-clearing logic that was removed earlier in this project for
+    destroying real sub-headers."""
+    if row_idx < 1:
+        return
+    for col_idx in range(1, max_col_scan + 1):
+        cell = sheet.cell(row=row_idx, column=col_idx)
+        if cell.value is None:
+            continue
+        normalized = normalize_header(cell.value)
+        if any(pattern in normalized for pattern in INTERNAL_ANNOTATION_PATTERNS):
+            safe_write(sheet, cell.coordinate, None)
 
 
 def _is_col_prefixed(rule_text: str) -> bool:
@@ -914,15 +971,20 @@ MONTH_NAMES_LOWER = {
 }
 
 
-def write_header_month(sheet, selected_month: str, selected_year: int | None = None) -> None:
+def write_header_month(sheet, selected_month: str, selected_year: int | None = None, header_row: int | None = None) -> None:
     target_keywords = ["month", "for the period ending", "wage month", "period"]
     if selected_month in {"All", "", None}:
         selected_month = "July"
     if selected_year is None:
         selected_year = datetime.now().year
 
+    # Never scan into (or past) the real data-table header row. Some templates have a
+    # genuine per-employee column literally named "Month" (e.g. Telangana FORM XXV) --
+    # scanning past the header would find and corrupt that column's own header text.
+    scan_limit = min(header_row, 10) if header_row else 10
+
     month_label = f"{selected_month}-{str(selected_year)[-2:]}"
-    for row_idx in range(1, 10):
+    for row_idx in range(1, scan_limit):
         for col_idx in range(1, sheet.max_column + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
             if cell.value is None:
@@ -976,16 +1038,22 @@ def write_header_month(sheet, selected_month: str, selected_year: int | None = N
                 return
 
 
-def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selected_year) -> None:
-    if selected_month in {"All", "", None}:
-        selected_month = "July"
-    if selected_year is None:
-        selected_year = datetime.now().year
-    month_label = f"{selected_month}-{str(selected_year)[-2:]}"
+def _replace_label_value(original_text: str, new_value: str) -> str:
+    """Split a template label like 'Name of establishment :- Old Value' on its
+    colon/dash separator and rebuild it with new_value, discarding whatever
+    followed the separator before. This makes header injection idempotent --
+    running it again just replaces the value again instead of appending another
+    copy, which is what caused 'Ahmedabad Palladium Ahmedabad Palladium' style
+    duplication before."""
+    base_label = re.split(r"\s*[:\-]+\s*", original_text, maxsplit=1)[0].strip()
+    if not base_label:
+        base_label = original_text.strip()
+    return f"{base_label}: {new_value}"
 
-    establishment_keywords = ["nameofestablishment", "shop", "factory"]
+
+def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selected_year) -> None:
+    establishment_keywords = ["nameofestablishment", "nameoftheshop", "nameofshop", "shopname", "nameoffactory", "factoryname"]
     address_keywords = ["address"]
-    month_keywords = ["forthemonth", "wageperiod", "shalltakeeffectfrom"]
 
     max_row_scan = min(25, sheet.max_row)
     max_col_scan = min(15, sheet.max_column)
@@ -999,11 +1067,11 @@ def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selec
             normalized_value = normalize_header(original_text)
 
             if unit_name and any(keyword in normalized_value for keyword in establishment_keywords):
-                safe_write(sheet, cell.coordinate, f"{original_text} {unit_name}")
+                safe_write(sheet, cell.coordinate, _replace_label_value(original_text, unit_name))
             elif unit_address and any(keyword in normalized_value for keyword in address_keywords):
-                safe_write(sheet, cell.coordinate, f"{original_text} {unit_address}")
-            elif any(keyword in normalized_value for keyword in month_keywords):
-                safe_write(sheet, cell.coordinate, f"{original_text} {month_label}")
+                safe_write(sheet, cell.coordinate, _replace_label_value(original_text, unit_address))
+            # Date/month/period text is handled exclusively by write_header_month and
+            # inject_form_dates -- deliberately NOT duplicated here anymore.
 
 
 def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year: int) -> None:
@@ -1256,6 +1324,8 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
     header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 52)]
     
     start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
+    if _looks_like_numbering_row(sheet, start_row):
+        start_row += 1
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
     
     logs = []
@@ -1349,8 +1419,9 @@ def generate_dynamic_form(
     selected_month = selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July"
 
     unit_master_details = get_unit_master_details(df_units, selected_unit)
+    header_row = find_header_row(sheet)
 
-    write_header_month(sheet, selected_month, selected_year)
+    write_header_month(sheet, selected_month, selected_year, header_row=header_row)
     inject_dynamic_headers(
         sheet,
         unit_master_details.get("unit_name", ""),
@@ -1361,11 +1432,13 @@ def generate_dynamic_form(
     if form_name:
         inject_form_dates(sheet, form_name, selected_month, selected_year)
 
-    header_row = find_header_row(sheet)
     header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 51)]
 
     form_key = str(form_name).strip().upper() if form_name else ""
     start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
+    if _looks_like_numbering_row(sheet, start_row):
+        start_row += 1
+    _clear_internal_annotation_row(sheet, start_row - 1)
     table_end_row = detect_table_end_row(sheet, start_row)
     row_count = len(filtered_df)
 
