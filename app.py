@@ -511,29 +511,13 @@ def _lookup_col_ref_value(letter: str, df_col_ref: pd.DataFrame | None, row_data
     """Look up a Coloums registry entry by its short code (e.g. 'B', 'AT1', 'EN') and
     return the matching field's value from the current employee row. Matching is
     tolerant of stray whitespace, hyphens, and underscores in the registry's own code
-    column, since Sheet1/Coloums entries have been hand-edited with inconsistent
-    formatting throughout this project (e.g. 'AT-1' vs 'AT_1' vs 'AT1')."""
-    if not letter or df_col_ref is None or df_col_ref.empty:
+    column ('AT-1' vs 'AT_1' vs 'AT1')."""
+    if not letter:
         return None
-    df_col_ref = df_col_ref.copy()
-    df_col_ref.columns = df_col_ref.columns.astype(str).str.strip()
-    if len(df_col_ref.columns) < 2:
-        return None
-
-    def _clean_code(value: object) -> str:
-        return re.sub(r"[\s\-_]+", "", str(value)).strip().upper()
-
-    target = _clean_code(letter)
-    lookup = df_col_ref.iloc[:, 0].apply(_clean_code)
-    values = df_col_ref.iloc[:, 1].astype(str).str.strip()
-    match_idx = lookup[lookup == target].index
-
-    if len(match_idx) > 0:
-        col_name = values.iloc[match_idx[0]]
-        if col_name in row_data:
-            val = row_data.get(col_name, "")
-            return val if not pd.isna(val) else ""
-
+    col_name = get_col_registry(df_col_ref).get(_clean_tag(letter))
+    if col_name is not None and col_name in row_data:
+        val = row_data.get(col_name, "")
+        return val if not pd.isna(val) else ""
     return None
 
 
@@ -651,6 +635,211 @@ def _substitute_embedded_col_refs(text: str, df_col_ref: pd.DataFrame | None, ro
     return EMBEDDED_COL_REF_RE.sub(_replace, text)
 
 
+# ---------------------------------------------------------------------------
+# Tag registry + arithmetic formula engine
+# ---------------------------------------------------------------------------
+_COL_REF_CACHE: dict = {}
+
+
+def _clean_tag(value: object) -> str:
+    return re.sub(r"[\s\-_]+", "", str(value)).strip().upper()
+
+
+def get_col_registry(df_col_ref: pd.DataFrame | None) -> dict[str, str]:
+    """{CLEAN_TAG: conso column name} built once per Coloums DataFrame (first match wins)."""
+    if df_col_ref is None or df_col_ref.empty or df_col_ref.shape[1] < 2:
+        return {}
+    cached = _COL_REF_CACHE.get(id(df_col_ref))
+    if cached is not None and cached[0] is df_col_ref:
+        return cached[1]
+    registry: dict[str, str] = {}
+    for code, name in zip(df_col_ref.iloc[:, 0], df_col_ref.iloc[:, 1]):
+        if pd.isna(code) or pd.isna(name):
+            continue
+        key = _clean_tag(code)
+        if key and key not in registry:
+            registry[key] = str(name).strip()
+    if len(_COL_REF_CACHE) > 8:
+        _COL_REF_CACHE.clear()
+    _COL_REF_CACHE[id(df_col_ref)] = (df_col_ref, registry)
+    return registry
+
+
+# "Col_BU", "Col _BC", "COL-ES", "Col - CQ", "Col BU" ...
+_FORMULA_COL_TAG_RE = re.compile(r"col[\s_\-]*([A-Za-z]{1,3}\d{0,2})(?![A-Za-z0-9])", re.IGNORECASE)
+_FORMULA_BARE_TAG_RE = re.compile(r"([A-Za-z]{1,3}\d{0,2})(?![A-Za-z0-9])")
+_FORMULA_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+_FORMULA_LONE_COL_RE = re.compile(r"col(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def tokenize_col_formula(rule_text: str, registry: dict[str, str] | None = None) -> tuple[list, list[str]]:
+    """Turn a rule like 'Col_BU -( Col _BC + Col _BD)' into tokens.
+    Returns (tokens, notes). Tokens: ('tag','BU') ('num',1.0) ('op','+') ('(',) (')',).
+    Parsing stops at the first piece of descriptive text after a complete operand
+    (e.g. 'Col_B Code' or 'Col_N Date of entry into service:')."""
+    registry = registry or {}
+    text = str(rule_text).replace("\xa0", " ").replace("{", "(").replace("}", ")").replace("[", "(").replace("]", ")")
+    text = text.replace("–", "-").replace("—", "-").replace("×", "*")
+    tokens: list = []
+    notes: list[str] = []
+    pos = 0
+    expect_operand = True
+    while pos < len(text):
+        ch = text[pos]
+        if ch.isspace():
+            pos += 1
+            continue
+        if expect_operand:
+            if ch == "(":
+                tokens.append(("(",)); pos += 1; continue
+            if ch in "+-":  # unary sign
+                tokens.append(("num", 0.0)); tokens.append(("op", ch)); pos += 1; continue
+            m = _FORMULA_COL_TAG_RE.match(text, pos)
+            if m:
+                tokens.append(("tag", _clean_tag(m.group(1)))); pos = m.end(); expect_operand = False; continue
+            m = _FORMULA_LONE_COL_RE.match(text, pos)
+            if m:  # 'COL (BU - ...)' -- the word Col wrapping a group
+                pos = m.end(); continue
+            m = _FORMULA_NUM_RE.match(text, pos)
+            if m:
+                tokens.append(("num", float(m.group(0)))); pos = m.end(); expect_operand = False; continue
+            m = _FORMULA_BARE_TAG_RE.match(text, pos)
+            if m and _clean_tag(m.group(1)) in registry and tokens:
+                tokens.append(("tag", _clean_tag(m.group(1)))); pos = m.end(); expect_operand = False; continue
+            break
+        else:
+            if ch in "+-*/":
+                tokens.append(("op", ch)); pos += 1; expect_operand = True; continue
+            if ch == ")":
+                tokens.append((")",)); pos += 1; continue
+            if ch == "(":  # 'Col_BU ( Col BO+Col BI )' -- missing operator, read as subtraction
+                tokens.append(("op", "-")); tokens.append(("(",)); pos += 1; expect_operand = True
+                notes.append("missing operator before '(' read as '-'")
+                continue
+            break  # trailing descriptive text
+    # drop a dangling operator / balance parentheses
+    while tokens and tokens[-1][0] == "op":
+        tokens.pop()
+    depth = 0
+    cleaned = []
+    for tok in tokens:
+        if tok[0] == "(":
+            depth += 1
+        elif tok[0] == ")":
+            if depth == 0:
+                continue
+            depth -= 1
+        cleaned.append(tok)
+    cleaned.extend([(")",)] * depth)
+    return cleaned, notes
+
+
+def _to_number(value: object):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return None if pd.isna(value) else float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def evaluate_col_formula(tokens: list, get_value) -> tuple[object, list[str]]:
+    """Evaluate tokens with + - * / and parentheses (no eval()). get_value(tag) -> raw value.
+    Missing / non-numeric operands count as 0. Returns (result, problems); result is ''
+    when every operand was blank."""
+    problems: list[str] = []
+    seen_any = [False]
+    pos = [0]
+
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+    def parse_expr():
+        val = parse_term()
+        while peek() and peek()[0] == "op" and peek()[1] in "+-":
+            op = tokens[pos[0]][1]; pos[0] += 1
+            rhs = parse_term()
+            val = val + rhs if op == "+" else val - rhs
+        return val
+
+    def parse_term():
+        val = parse_atom()
+        while peek() and peek()[0] == "op" and peek()[1] in "*/":
+            op = tokens[pos[0]][1]; pos[0] += 1
+            rhs = parse_atom()
+            if op == "*":
+                val *= rhs
+            elif rhs == 0:
+                problems.append("division by zero -> 0"); val = 0.0
+            else:
+                val /= rhs
+        return val
+
+    def parse_atom():
+        tok = peek()
+        if tok is None:
+            return 0.0
+        pos[0] += 1
+        if tok[0] == "num":
+            return tok[1]
+        if tok[0] == "tag":
+            raw = get_value(tok[1])
+            number = _to_number(raw)
+            if raw is None:
+                problems.append(f"tag {tok[1]} not found")
+            if number is None:
+                return 0.0
+            seen_any[0] = True
+            return number
+        if tok[0] == "(":
+            val = parse_expr()
+            if peek() and peek()[0] == ")":
+                pos[0] += 1
+            return val
+        return 0.0
+
+    result = parse_expr()
+    if not seen_any[0]:
+        return "", problems
+    result = round(result, 2)
+    if result == int(result):
+        result = int(result)
+    return result, problems
+
+
+def resolve_formula_rule(rule_text: str, df_col_ref: pd.DataFrame | None, row_data: dict) -> object:
+    """Resolve a Col-prefixed rule: a single tag (raw value returned) or an arithmetic expression."""
+    registry = get_col_registry(df_col_ref)
+    tokens, _ = tokenize_col_formula(rule_text, registry)
+    tags = [t for t in tokens if t[0] == "tag"]
+    if not tags:
+        return ""
+    if len(tokens) == 1:  # plain single tag
+        value = _lookup_col_ref_value(tags[0][1], df_col_ref, row_data)
+        return value if value is not None else ""
+    return evaluate_col_formula(tokens, lambda tag: _lookup_col_ref_value(tag, df_col_ref, row_data))[0]
+
+
+
+def _refresh_month_in_text(text: str, active_month: str | None, selected_year: int | None) -> str:
+    """Fixed-text rules such as 'During wage month June 2026' carry a stale month.
+    Re-point 'wage month / period / month of <Month YYYY>' to the selected month."""
+    if not text or active_month in {"All", "", None}:
+        return text
+    year_value = selected_year if selected_year is not None else datetime.now().year
+    try:
+        month_name = datetime(int(year_value), datetime.strptime(str(active_month)[:3], "%b").month, 1).strftime("%B")
+    except ValueError:
+        return text
+    pattern = re.compile(r"((?:wage\s+)?(?:month|period)(?:\s+of|\s+ending)?\s*[:\-]*\s*)" + MONTH_NAME_ALTERNATION + r"[\s,\-]*(\d{4}|\d{2})\b", re.IGNORECASE)
+    return pattern.sub(lambda m: f"{m.group(1)}{month_name} {year_value}", text)
+
+
 def resolve_col_rule(
     rule_str: object,
     df_col_ref: pd.DataFrame | None,
@@ -675,7 +864,7 @@ def resolve_col_rule(
 
     if "fixed text" in lowered_rule:
         cleaned = re.sub(r"[\(\-]?\s*fixed\s*text\s*\)?", "", rule_text, flags=re.IGNORECASE)
-        return cleaned.strip(" -")
+        return _refresh_month_in_text(cleaned.strip(" -"), active_month, selected_year)
 
     if lowered_rule == "auto_generated" or lowered_rule.startswith("auto"):
         return idx + 1
@@ -711,24 +900,8 @@ def resolve_col_rule(
                     resolved_parts.append(str(value).strip())
         return ", ".join(resolved_parts)
 
-    if _is_col_prefixed(rule_text) and "+" in rule_text:
-        total = 0.0
-        any_value = False
-        for part in rule_text.split("+"):
-            letter = _extract_col_letter(part)
-            value = _lookup_col_ref_value(letter, df_col_ref, row_data)
-            if value not in (None, ""):
-                try:
-                    total += float(value)
-                    any_value = True
-                except (TypeError, ValueError):
-                    pass
-        return total if any_value else ""
-
     if _is_col_prefixed(rule_text):
-        letter = _extract_col_letter(rule_text)
-        value = _lookup_col_ref_value(letter, df_col_ref, row_data)
-        return value if value is not None else ""
+        return resolve_formula_rule(rule_text, df_col_ref, row_data)
 
     if rule_text.isalpha() and rule_text.isupper() and 1 <= len(rule_text) <= 3:
         value = _lookup_col_ref_value(rule_text, df_col_ref, row_data)
@@ -971,107 +1144,332 @@ MONTH_NAMES_LOWER = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Header injection (establishment name / address / month)
+# ---------------------------------------------------------------------------
+COMPANY_LEGAL_NAME = "Hunger Pangs Private Limited"
+# 'company'      -> "Hunger Pangs Private Limited"
+# 'unit'         -> "Ahmedabad Palladium"
+# 'company_unit' -> "Hunger Pangs Private Limited - Ahmedabad Palladium"
+ESTABLISHMENT_NAME_STYLE = "company"
+
+_LABEL_SPLIT_RE = re.compile(r"\s*(?:[:：]\s*[-–—]*|\s[-–—]+\s*|[-–—]+\s)\s*")
+
+
+def _split_label_value(text: str) -> tuple[str, str | None, str]:
+    """'Name of establishment :- Old' -> ('Name of establishment', 'Old', ' :- ').
+    No separator -> (text, None, '')."""
+    m = _LABEL_SPLIT_RE.search(text)
+    if not m or m.start() == 0:
+        return text.strip(), None, ""
+    return text[: m.start()].strip(), text[m.end():].strip(), text[m.start(): m.end()]
+
+
+def _classify_header_label(label: str) -> str | None:
+    """Which injectable field is this template label asking for?
+    Returns 'est_name', 'est_name_address', 'address', 'employer_address' or None.
+    Table column headers are never passed in (callers only scan rows above the table)."""
+    n = normalize_header(label)
+    if not n or len(n) > 80:
+        return None
+    has_addr = "address" in n
+    is_est = any(k in n for k in ("establishment", "nameoftheshop", "nameofshop", "shopname", "nameoffactory", "factoryname"))
+    is_emp = any(k in n for k in ("employer", "manager", "occupier", "owner"))
+    if is_emp:
+        return "employer_address" if has_addr else None
+    if is_est and has_addr and n.startswith(("nameof", "nameand")) :
+        return "est_name_address"
+    if is_est and not has_addr and (n.startswith(("nameof", "name")) or n in ("establishmentname", "theestablishmentname")
+                                    or "establishmentname" in n or "nameofthe" in n):
+        return "est_name"
+    if has_addr and (n.startswith("address") or n.startswith("addressofthe")):
+        return "address"
+    return None
+
+
+def _merged_end_col(sheet, row: int, col: int) -> int:
+    for rng in sheet.merged_cells.ranges:
+        if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
+            return rng.max_col
+    return col
+
+
+def _find_value_cell(sheet, row: int, col: int, max_reach: int = 12):
+    """The cell that holds (or should hold) the value for a label-only cell: the first
+    non-empty plain value to the right of the label's merged range, otherwise the first
+    empty writable cell. Stops at the next label (text ending in ':')."""
+    start = _merged_end_col(sheet, row, col) + 1
+    first_empty = None
+    for c in range(start, min(sheet.max_column, start + max_reach) + 1):
+        cell = sheet.cell(row=row, column=c)
+        val = cell.value
+        if val is None or (isinstance(val, str) and not val.strip()):
+            if first_empty is None and not isinstance(cell, MergedCell):
+                first_empty = cell
+            continue
+        if isinstance(val, str):
+            lbl, existing, _sep = _split_label_value(val)
+            if val.strip().endswith(":") or (existing is not None and _classify_header_label(lbl)):
+                break
+        return cell
+    return first_empty
+
+
+def get_header_values(unit_master_details: dict[str, str], df_units=None, selected_unit=None) -> dict[str, str]:
+    unit = (unit_master_details.get("unit_name") or "").strip()
+    address = (unit_master_details.get("unit_address") or "").strip()
+    if ESTABLISHMENT_NAME_STYLE == "unit":
+        est = unit
+    elif ESTABLISHMENT_NAME_STYLE == "company_unit" and unit:
+        est = f"{COMPANY_LEGAL_NAME} - {unit}"
+    else:
+        est = COMPANY_LEGAL_NAME
+    # optional Units_Master override for the legal establishment name
+    if df_units is not None and selected_unit:
+        try:
+            cols = {str(c).strip().lower(): c for c in df_units.columns}
+            key = next((cols[k] for k in ("establishment name", "legal name", "legal entity", "company name") if k in cols), None)
+            if key is not None:
+                unit_col = next((c for c in df_units.columns if str(c).strip().lower() == "unit"), None)
+                match = df_units[df_units[unit_col].apply(normalize_unit_key) == normalize_unit_key(selected_unit)]
+                if not match.empty and pd.notna(match.iloc[0][key]) and str(match.iloc[0][key]).strip():
+                    est = str(match.iloc[0][key]).strip()
+        except Exception:
+            pass
+    employer = ""
+    if df_units is not None and selected_unit:
+        try:
+            employer = str(get_unit_master_column_value(df_units, selected_unit, "N") or "").strip()
+        except Exception:
+            employer = ""
+    return {"est_name": est, "address": address, "employer_address": employer or address, "unit": unit}
+
+
+def _header_write(sheet, coordinate: str, value) -> None:
+    """safe_write for title-block values, always in black text (some templates mark the
+    month placeholder in red)."""
+    safe_write(sheet, coordinate, value)
+    cell = sheet[coordinate]
+    if isinstance(cell, MergedCell):
+        for rng in sheet.merged_cells.ranges:
+            if coordinate in rng:
+                cell = sheet.cell(rng.min_row, rng.min_col)
+                break
+    font = copy(cell.font)
+    font.color = "FF000000"
+    cell.font = font
+
+
+def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selected_year,
+                           header_row: int | None = None, values: dict[str, str] | None = None) -> list[str]:
+    """Write establishment name / address (and employer name+address) into the sheet's title
+    block. Works on the rows ABOVE the data-table header only, so table column headings such as
+    'Name & Address of nominee' are never touched. Handles both layouts:
+      * label and value in one cell  ('Address: old value')  -> replaced in place
+      * label cell + separate value cell ('Address' | ... | 'old value') -> value cell written,
+        label left exactly as the template has it.
+    Returns a log of what was written (used by the diagnostics)."""
+    if values is None:
+        values = {"est_name": unit_name or "", "address": unit_address or "",
+                  "employer_address": unit_address or "", "unit": unit_name or ""}
+    limit = (header_row if header_row else 25)
+    limit = max(1, min(limit, 25))
+    log: list[str] = []
+
+    # first pass: find the labels
+    found = []
+    for row_idx in range(1, limit):
+        for col_idx in range(1, min(sheet.max_column, 30) + 1):
+            cell = sheet.cell(row=row_idx, column=col_idx)
+            if isinstance(cell, MergedCell) or not isinstance(cell.value, str) or not cell.value.strip():
+                continue
+            label, existing, sep = _split_label_value(cell.value)
+            kind = _classify_header_label(label)
+            if kind:
+                found.append((cell, label, existing, sep, kind))
+    kinds_present = {k for *_, k in found}
+
+    for cell, label, existing, sep, kind in found:
+        if kind == "est_name_address":
+            # a separate 'Address' label elsewhere gets the address; otherwise write both here
+            value = values["est_name"] if "address" in kinds_present else f"{values['est_name']}, {values['address']}".strip(", ")
+        else:
+            value = values.get(kind, "")
+        if not value:
+            continue
+        if kind == "employer_address":
+            # templates already carry the employer's name/address -- only fill an empty slot
+            if existing:
+                continue
+            target = _find_value_cell(sheet, cell.row, cell.column)
+            if target is not None and target.value in (None, ""):
+                _header_write(sheet, target.coordinate, value)
+                log.append(f"{cell.coordinate}: {kind} -> {target.coordinate}")
+            continue
+        if existing:  # label + old value in one cell
+            _header_write(sheet, cell.coordinate, f"{label}{sep if sep.strip() else ': '}{value}")
+            log.append(f"{cell.coordinate}: {kind} (in place)")
+            continue
+        target = _find_value_cell(sheet, cell.row, cell.column)
+        if target is not None:
+            _header_write(sheet, target.coordinate, value)
+            log.append(f"{cell.coordinate}: {kind} -> {target.coordinate}")
+        else:
+            _header_write(sheet, cell.coordinate, f"{label.rstrip(' :')}: {value}")
+            log.append(f"{cell.coordinate}: {kind} (appended to label)")
+    return log
+
+
+def _first_of_month(selected_month: str, selected_year: int):
+    try:
+        month_num = datetime.strptime(str(selected_month)[:3], "%b").month
+    except ValueError:
+        month_num = datetime.now().month
+    return datetime(int(selected_year), month_num, 1)
+
+
+_DAY_MONTH_YEAR_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+" + MONTH_NAME_ALTERNATION + r"[\s,]+(\d{4})\b", re.IGNORECASE)
+
+
+_NUMERIC_DATE_RE = re.compile(r"\b(\d{1,2})([/\-.])(\d{1,2})([/\-.])(?:19|20)\d{2}\b")
+
+
+def _ordinal(day: int) -> str:
+    suffix = "th" if 10 <= day % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def _refresh_period_range_text(text: str, selected_month: str, selected_year: int) -> str:
+    """Re-point 'From 1st June 2026 To 30th June 2026' style ranges to the selected month
+    (days <= 15 become the 1st, later days become the last day of the month)."""
+    first = _first_of_month(selected_month, selected_year)
+    last_day = calendar.monthrange(first.year, first.month)[1]
+    month_name = first.strftime("%B")
+
+    def _sub(m: re.Match) -> str:
+        day = _ordinal(1 if int(m.group(1)) <= 15 else last_day)
+        return f"{day} {month_name} {first.year}"
+
+    text = _DAY_MONTH_YEAR_RE.sub(_sub, text)
+
+    def _sub_numeric(m: re.Match) -> str:  # 01/06/2026, 30-06-2026
+        day = 1 if int(m.group(1)) <= 15 else last_day
+        return f"{day:0{len(m.group(1))}d}{m.group(2)}{first.month:0{len(m.group(3))}d}{m.group(4)}{first.year}"
+
+    return _NUMERIC_DATE_RE.sub(_sub_numeric, text)
+
+
+def _month_in_style(original: str, selected_month: str, selected_year: int) -> str:
+    """Write the selected month the way the template wrote its own: 'June 2026', 'June-26', 'Jun-2026'..."""
+    first = _first_of_month(selected_month, selected_year)
+    word = re.match(r"[A-Za-z]+", original.strip()).group(0)
+    name = first.strftime("%B") if len(word) > 3 else first.strftime("%b")
+    if word.isupper():
+        name = name.upper()
+    sep_match = re.search(r"[A-Za-z]+([\s\-]*)(\d+)", original)
+    sep = sep_match.group(1) if sep_match else "-"
+    digits = sep_match.group(2) if sep_match else "00"
+    year = str(first.year) if len(digits) == 4 else str(first.year)[-2:]
+    return f"{name}{sep or ' '}{year}"
+
+
 def write_header_month(sheet, selected_month: str, selected_year: int | None = None, header_row: int | None = None) -> None:
-    target_keywords = ["month", "for the period ending", "wage month", "period"]
+    """Make every month / wage-period marker in the title block show the selected month:
+      * text cells with an embedded 'Month-YY' / 'Month YYYY' -> that part is replaced
+      * 'Month:' style labels with a separate value cell -> value cell written (never the label)
+      * stale date cells (a 1st-of-month date left in the template) -> set to the 1st of the month
+    Rows at/after the data-table header are never touched (a 'Month' data column stays intact)."""
     if selected_month in {"All", "", None}:
         selected_month = "July"
     if selected_year is None:
         selected_year = datetime.now().year
+    keywords = ("month", "forperiod", "periodending", "wageperiod", "period")
+    first_day = _first_of_month(selected_month, selected_year)
+    month_label = first_day.strftime("%B %Y")
+    limit = max(1, min(header_row if header_row else 12, 25))
+    done_rows: set[int] = set()
 
-    # Never scan into (or past) the real data-table header row. Some templates have a
-    # genuine per-employee column literally named "Month" (e.g. Telangana FORM XXV) --
-    # scanning past the header would find and corrupt that column's own header text.
-    scan_limit = min(header_row, 10) if header_row else 10
-
-    month_label = f"{selected_month}-{str(selected_year)[-2:]}"
-    for row_idx in range(1, scan_limit):
-        for col_idx in range(1, sheet.max_column + 1):
+    for row_idx in range(1, limit + 1):
+        for col_idx in range(1, min(sheet.max_column, 60) + 1):
             cell = sheet.cell(row=row_idx, column=col_idx)
-            if cell.value is None:
+            if isinstance(cell, MergedCell) or cell.value is None:
                 continue
-            normalized_value = normalize_header(cell.value)
-            if any(keyword in normalized_value for keyword in target_keywords):
-                current_text = str(cell.value)
-                existing_date_match = DATE_IN_TEXT_RE.search(current_text)
-                if existing_date_match:
-                    # Replace the stale month/year already embedded in this cell's own text,
-                    # instead of writing into a neighboring cell and leaving the old date behind.
-                    new_text = current_text[: existing_date_match.start()] + month_label
-                    safe_write(sheet, cell.coordinate, new_text)
-                    return
-
-                # Some templates split the label and its value across several non-adjacent
-                # cells in the same row (e.g. "For the month of:" ... "June" ... "Year" "2026").
-                # Scan forward for an existing month-name cell (and a separate year cell after
-                # it) before falling back to the naive "write into the very next cell" behavior.
-                replaced = False
-                for lookahead in range(1, 8):
-                    probe_col = col_idx + lookahead
-                    if probe_col > sheet.max_column:
-                        break
-                    probe_cell = sheet.cell(row=row_idx, column=probe_col)
-                    probe_text = str(probe_cell.value or "").strip()
-                    if not probe_text:
+            value = cell.value
+            if row_idx == limit:
+                # the table-header row itself: only refresh explicit dates such as
+                # 'For the Wage Period Ending : 30th June 2026' (a plain 'Month' column is left alone)
+                if isinstance(value, str) and (_DAY_MONTH_YEAR_RE.search(value) or _NUMERIC_DATE_RE.search(value)):
+                    _header_write(sheet, cell.coordinate, _refresh_period_range_text(value, selected_month, selected_year))
+                elif isinstance(value, str) and DATE_IN_TEXT_RE.search(value) and any(k in normalize_header(value) for k in keywords):
+                    m = DATE_IN_TEXT_RE.search(value)
+                    _header_write(sheet, cell.coordinate, value[: m.start()] + _month_in_style(m.group(0), selected_month, selected_year) + value[m.end():])
+                continue
+            if isinstance(value, datetime):  # stale date left in the template
+                if value.day == 1:
+                    _header_write(sheet, cell.coordinate, first_day)
+                continue
+            if not isinstance(value, str):
+                continue
+            if _DAY_MONTH_YEAR_RE.search(value) or _NUMERIC_DATE_RE.search(value):  # 'From: 1st June 2026  To: 30th June 2026'
+                refreshed = _refresh_period_range_text(value, selected_month, selected_year)
+                if refreshed != value:
+                    _header_write(sheet, cell.coordinate, refreshed)
+                continue
+            norm = normalize_header(value)
+            if not any(k in norm for k in keywords) or len(norm) > 120 or "auto" in norm:
+                # no month label, but an explicit 'June 2026' in the title block
+                # (e.g. 'Name of the employer : ...      JUNE 2026', 'Year: June 2026')
+                full = re.search(MONTH_NAME_ALTERNATION + r"[\s,\-]*(?:19|20)\d{2}\b", value, re.IGNORECASE)
+                if full and "auto" not in norm:
+                    _header_write(sheet, cell.coordinate, value[: full.start()] + _month_in_style(full.group(0), selected_month, selected_year) + value[full.end():])
+                continue
+            m = DATE_IN_TEXT_RE.search(value)
+            if m:
+                _header_write(sheet, cell.coordinate, value[: m.start()] + _month_in_style(m.group(0), selected_month, selected_year) + value[m.end():])
+                continue
+            mn = re.search(r"\b" + MONTH_NAME_ALTERNATION + r"\b", value, re.IGNORECASE)
+            if mn:  # 'Month: June Year: 2026' -> month name and the year are separate
+                new_text = value[: mn.start()] + _first_of_month(selected_month, selected_year).strftime("%B") + value[mn.end():]
+                new_text = re.sub(r"\b(19|20)\d{2}\b", str(selected_year), new_text)
+                _header_write(sheet, cell.coordinate, new_text)
+                continue
+            if row_idx in done_rows:
+                continue
+            # label-only cell: find the month value cell to its right (outside any merge)
+            label_text, existing, sep = _split_label_value(value)
+            if len(norm) > 30 and not existing:
+                continue
+            if existing:  # 'Month: <something not a month>' -> overwrite value
+                _header_write(sheet, cell.coordinate, f"{label_text}{sep if sep.strip() else ': '}{month_label}")
+                done_rows.add(row_idx)
+                continue
+            start = _merged_end_col(sheet, row_idx, col_idx) + 1
+            for c in range(start, min(sheet.max_column, start + 8) + 1):
+                probe = sheet.cell(row=row_idx, column=c)
+                pv = probe.value
+                if pv is None or (isinstance(pv, str) and not pv.strip()):
+                    if isinstance(probe, MergedCell):
                         continue
-                    probe_key = probe_text.lower().rstrip(".").strip()
-                    if probe_key in MONTH_NAMES_LOWER or DATE_IN_TEXT_RE.search(probe_text):
-                        safe_write(sheet, probe_cell.coordinate, selected_month)
-                        for year_lookahead in range(1, 5):
-                            year_col = probe_col + year_lookahead
-                            if year_col > sheet.max_column:
-                                break
-                            year_cell = sheet.cell(row=row_idx, column=year_col)
-                            year_text = str(year_cell.value or "").strip()
-                            if re.fullmatch(r"\d{4}(\.0)?", year_text):
-                                safe_write(sheet, year_cell.coordinate, selected_year)
-                                break
-                        replaced = True
-                        break
-                if replaced:
-                    return
-
-                next_cell = sheet.cell(row=row_idx, column=col_idx + 1)
-                if next_cell.value is None or normalize_header(str(next_cell.value)) != normalize_header(month_label):
-                    safe_write(sheet, next_cell.coordinate, month_label)
-                else:
-                    safe_write(sheet, cell.coordinate, month_label)
-                return
-
-
-def _replace_label_value(original_text: str, new_value: str) -> str:
-    """Split a template label like 'Name of establishment :- Old Value' on its
-    colon/dash separator and rebuild it with new_value, discarding whatever
-    followed the separator before. This makes header injection idempotent --
-    running it again just replaces the value again instead of appending another
-    copy, which is what caused 'Ahmedabad Palladium Ahmedabad Palladium' style
-    duplication before."""
-    base_label = re.split(r"\s*[:\-]+\s*", original_text, maxsplit=1)[0].strip()
-    if not base_label:
-        base_label = original_text.strip()
-    return f"{base_label}: {new_value}"
-
-
-def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selected_year) -> None:
-    establishment_keywords = ["nameofestablishment", "nameoftheshop", "nameofshop", "shopname", "nameoffactory", "factoryname"]
-    address_keywords = ["address"]
-
-    max_row_scan = min(25, sheet.max_row)
-    max_col_scan = min(15, sheet.max_column)
-
-    for row_idx in range(1, max_row_scan + 1):
-        for col_idx in range(1, max_col_scan + 1):
-            cell = sheet.cell(row=row_idx, column=col_idx)
-            if cell.value is None:
-                continue
-            original_text = str(cell.value)
-            normalized_value = normalize_header(original_text)
-
-            if unit_name and any(keyword in normalized_value for keyword in establishment_keywords):
-                safe_write(sheet, cell.coordinate, _replace_label_value(original_text, unit_name))
-            elif unit_address and any(keyword in normalized_value for keyword in address_keywords):
-                safe_write(sheet, cell.coordinate, _replace_label_value(original_text, unit_address))
-            # Date/month/period text is handled exclusively by write_header_month and
-            # inject_form_dates -- deliberately NOT duplicated here anymore.
+                    _header_write(sheet, probe.coordinate, month_label)
+                    done_rows.add(row_idx)
+                    break
+                if isinstance(pv, datetime):
+                    _header_write(sheet, probe.coordinate, first_day)
+                    done_rows.add(row_idx)
+                    break
+                ptxt = str(pv).strip()
+                if ptxt.lower().rstrip(".") in MONTH_NAMES_LOWER or DATE_IN_TEXT_RE.search(ptxt):
+                    _header_write(sheet, probe.coordinate, selected_month if ptxt.lower().rstrip(".") in MONTH_NAMES_LOWER else month_label)
+                    # separate year cell after a month-name cell
+                    for yc in range(c + 1, min(sheet.max_column, c + 4) + 1):
+                        ycell = sheet.cell(row=row_idx, column=yc)
+                        if re.fullmatch(r"\d{4}(\.0)?", str(ycell.value or "").strip()):
+                            _header_write(sheet, ycell.coordinate, selected_year)
+                            break
+                    done_rows.add(row_idx)
+                    break
+                if isinstance(pv, str) and pv.strip().endswith(":"):
+                    break
 
 
 def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year: int) -> None:
@@ -1358,25 +1756,25 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
             extracted_value = "[SKIPPED: TEMPLATE FORMULA]"
             note = f"Protected template constant: {source_cell.value}"
         elif _is_col_prefixed(rule):
-            if "+" in rule:
-                sub_letters = [_extract_col_letter(part) for part in rule.split("+")]
-                mapped_target = " + ".join(sub_letters)
-            else:
-                sub_letters = [_extract_col_letter(rule)]
-                mapped_target = sub_letters[0]
-
-            lookup = df_col_ref.iloc[:, 0].astype(str).str.strip().str.upper()
-            missing_letters = [l for l in sub_letters if l not in set(lookup)]
+            registry = get_col_registry(df_col_ref)
+            tokens, parse_notes = tokenize_col_formula(rule, registry)
+            sub_letters = [t[1] for t in tokens if t[0] == "tag"]
+            mapped_target = " ".join(
+                (t[1] if t[0] in ("tag", "op") else str(t[1]) if t[0] == "num" else t[0]) for t in tokens
+            )
+            missing_letters = [l for l in sub_letters if l not in registry]
 
             resolved_value = resolve_col_rule(rule, df_col_ref, row, 0)
             if resolved_value not in (None, ""):
                 extracted_value = str(resolved_value)
-                note = "✅ Exact match successful"
+                note = "✅ Exact match successful" if len(tokens) == 1 else "✅ Formula evaluated"
             elif missing_letters:
                 note = f"❌ Rule letter(s) {', '.join(missing_letters)} not found in Coloums mapping sheet!"
             else:
                 extracted_value = "BLANK"
                 note = f"❌ TARGET '{mapped_target}' resolved but this employee's data is blank for it."
+            if parse_notes:
+                note += " (" + "; ".join(parse_notes) + ")"
         elif rule:
             resolved_value = resolve_col_rule(rule, df_col_ref, row, 0)
             extracted_value = str(resolved_value) if resolved_value not in (None, "") else "BLANK"
@@ -1428,6 +1826,8 @@ def generate_dynamic_form(
         unit_master_details.get("unit_address", ""),
         selected_month,
         selected_year,
+        header_row=header_row,
+        values=get_header_values(unit_master_details, df_units, selected_unit),
     )
     if form_name:
         inject_form_dates(sheet, form_name, selected_month, selected_year)
@@ -1531,6 +1931,161 @@ def generate_dynamic_form(
     workbook.save(output)
     output.seek(0)
     return output
+
+
+# ---------------------------------------------------------------------------
+# Mapping Editor helpers (template header <-> Conso Data header -> Sheet1 rule)
+# ---------------------------------------------------------------------------
+RULE_KIND_KEEP = "Keep current rule"
+RULE_KIND_CONSO = "Conso Data column"
+RULE_KIND_FORMULA = "Formula (Conso columns with + - × ÷)"
+RULE_KIND_FIXED = "Fixed text"
+RULE_KIND_AUTO = "Serial number (auto)"
+RULE_KIND_WAGE_MONTH = "Wage month"
+RULE_KIND_UNIT = "Unit Master column(s)"
+RULE_KIND_BLANK = "Blank (clear rule)"
+RULE_KINDS = [RULE_KIND_KEEP, RULE_KIND_CONSO, RULE_KIND_FORMULA, RULE_KIND_FIXED,
+              RULE_KIND_AUTO, RULE_KIND_WAGE_MONTH, RULE_KIND_UNIT, RULE_KIND_BLANK]
+FORMULA_OPERATORS = {"+": "+", "−": "-", "×": "*", "÷": "/"}
+
+
+def conso_header_options(df_col_ref: pd.DataFrame | None) -> dict[str, str]:
+    """{tag: 'BU · Earned Gross Salary'} in Coloums-sheet order, skipping separator rows."""
+    options: dict[str, str] = {}
+    if df_col_ref is None or df_col_ref.empty or df_col_ref.shape[1] < 2:
+        return options
+    for code, name in zip(df_col_ref.iloc[:, 0], df_col_ref.iloc[:, 1]):
+        if pd.isna(code) or pd.isna(name):
+            continue
+        tag = _clean_tag(code)
+        label = str(name).strip()
+        if not tag or label in {":", ""} or tag in options:
+            continue
+        options[tag] = f"{tag} · {label}"
+    return options
+
+
+def build_rule_string(kind: str, *, tags: list[str] | None = None, operators: list[str] | None = None,
+                      text: str = "", unit_letters: list[str] | None = None) -> str:
+    """The exact text stored in Sheet1 for a UI selection (round-trips through resolve_col_rule)."""
+    if kind == RULE_KIND_CONSO and tags:
+        return f"Col_{tags[0]}"
+    if kind == RULE_KIND_FORMULA and tags:
+        parts = [f"Col_{tags[0]}"]
+        for op, tag in zip(operators or [], tags[1:]):
+            parts.append(f"{FORMULA_OPERATORS.get(op, op)} Col_{tag}")
+        return " ".join(parts)
+    if kind == RULE_KIND_FIXED:
+        return f"{text.strip()} (Fixed Text)" if text.strip() else ""
+    if kind == RULE_KIND_AUTO:
+        return "Auto_generated"
+    if kind == RULE_KIND_WAGE_MONTH:
+        return "Wage Month"
+    if kind == RULE_KIND_UNIT and unit_letters:
+        return " + ".join(f"Unit Master_Col_{l}" for l in unit_letters)
+    return ""
+
+
+def describe_rule(rule: object, df_col_ref: pd.DataFrame | None) -> str:
+    """Human readable version of a stored rule, e.g. 'Col_BU - Col_BC' -> 'Earned Gross Salary − Earned Basic'."""
+    text = "" if rule is None or (not isinstance(rule, str) and pd.isna(rule)) else str(rule).strip()
+    if not text:
+        return ""
+    if not _is_col_prefixed(text):
+        return text
+    registry = get_col_registry(df_col_ref)
+    tokens, _ = tokenize_col_formula(text, registry)
+    pretty = {"+": "+", "-": "−", "*": "×", "/": "÷"}
+    out = []
+    for tok in tokens:
+        if tok[0] == "tag":
+            out.append(registry.get(tok[1], f"?{tok[1]}"))
+        elif tok[0] == "op":
+            out.append(pretty[tok[1]])
+        elif tok[0] == "num":
+            out.append(f"{tok[1]:g}")
+        else:
+            out.append(tok[0])
+    return " ".join(out)
+
+
+def suggest_conso_tag(template_label: str, conso_options: dict[str, str]) -> str | None:
+    """Best-guess Conso Data tag for a template header (shown as a hint, never applied automatically)."""
+    import difflib
+    target = normalize_header(template_label.split("›")[-1])
+    if not target or target in {"noheader"}:
+        return None
+    best_tag, best_score = None, 0.0
+    for tag, label in conso_options.items():
+        name = normalize_header(label.split("·", 1)[-1])
+        if not name:
+            continue
+        score = difflib.SequenceMatcher(None, target, name).ratio()
+        if name in target or target in name:
+            score = max(score, 0.75)
+        if score > best_score:
+            best_tag, best_score = tag, score
+    return best_tag if best_score >= 0.6 else None
+
+
+def get_template_columns(template_bytes, selected_state: str | None, form_name: str | None, max_cols: int = 51) -> list[dict]:
+    """Template column list [{'col': 1, 'letter': 'A', 'label': 'Code'}, ...] built from the
+    table's header rows (merged parent headings are joined with their sub-headings)."""
+    template_bytes.seek(0)
+    sheet = load_workbook(template_bytes).active
+    header_row = find_header_row(sheet)
+    start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
+    last_header_row = max(header_row, start_row - 1)
+    anchors = {}
+    for rng in sheet.merged_cells.ranges:
+        anchors[(rng.min_row, rng.min_col, rng.max_row, rng.max_col)] = sheet.cell(rng.min_row, rng.min_col).value
+
+    def text_at(r: int, c: int):
+        cell = sheet.cell(r, c)
+        if cell.value is not None:
+            return cell.value
+        for (r1, c1, r2, c2), val in anchors.items():
+            if r1 <= r <= r2 and c1 <= c <= c2:
+                return val
+        return None
+
+    columns = []
+    last_col = min(sheet.max_column, max_cols)
+    for c in range(1, last_col + 1):
+        parts: list[str] = []
+        for r in range(header_row, last_header_row + 1):
+            v = text_at(r, c)
+            if v is None:
+                continue
+            t = re.sub(r"\s+", " ", str(v)).strip()
+            if not t or re.fullmatch(r"\d{1,2}(\.0)?", t) or t in parts:
+                continue
+            parts.append(t)
+        columns.append({"col": c, "letter": get_column_letter(c), "label": " › ".join(parts) or "(no header)"})
+    while columns and columns[-1]["label"] == "(no header)":
+        columns.pop()
+    return columns
+
+
+def get_rule_for_column(df_mapping_rules: pd.DataFrame, rule_row: int, col_idx: int) -> str:
+    j = col_idx + 6
+    if j >= df_mapping_rules.shape[1]:
+        return ""
+    v = df_mapping_rules.iloc[rule_row, j]
+    return "" if pd.isna(v) else str(v).strip()
+
+
+def save_rule_edits(master_path: str, rule_row: int, edits: dict[int, str]) -> bytes:
+    """Write {template_col_idx: rule_text} into Sheet1 of the master workbook (all other
+    sheets are left as they are) and return the saved file's bytes."""
+    workbook = load_workbook(master_path)
+    sheet = workbook["Sheet1"]
+    for col_idx, rule_text in edits.items():
+        sheet.cell(row=rule_row + 1, column=col_idx + 7).value = rule_text if rule_text != "" else None
+    workbook.save(master_path)
+    with open(master_path, "rb") as f:
+        return f.read()
+
 
 
 st.set_page_config(page_title="HR Compliance Engine", layout="wide")
@@ -1860,7 +2415,7 @@ def build_archive_zip(file_paths: list[Path]) -> BytesIO:
     return zip_buffer
 
 
-tab1, tab2, tab3 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms", "Notice Dashboard"])
+tab1, tab2, tab3, tab4 = st.tabs(["⚡ Statutory Form Generator", "Generated Forms", "Notice Dashboard", "🧩 Mapping Editor"])
 
 with tab1:
     st.markdown("### Selection Filters")
@@ -2190,3 +2745,157 @@ with tab3:
     
     # Embed the HTML web app seamlessly into Streamlit with scrolling enabled for the data table
     components.iframe(GAS_WEB_APP_URL, height=900, scrolling=True)
+
+
+with tab4:
+    st.markdown("### Mapping Editor")
+    st.caption(
+        "Pair each column of a statutory template with a Conso Data header (or a formula built from "
+        "Conso Data headers). Saving writes the matching tag into the Sheet1 rules for you - no more "
+        "hand-typing Col_XX tags."
+    )
+
+    rule_states = sorted({str(v).strip() for v in df_mapping_rules.iloc[:, 0].dropna() if str(v).strip()}) if not df_mapping_rules.empty else []
+    if not rule_states:
+        st.warning("Sheet1 has no state/form rows to edit.")
+    else:
+        me_col1, me_col2 = st.columns(2)
+        with me_col1:
+            me_state = st.selectbox("State", rule_states, key="me_state")
+        me_forms = [
+            str(df_mapping_rules.iloc[i, 1]).strip()
+            for i in range(df_mapping_rules.shape[0])
+            if pd.notna(df_mapping_rules.iloc[i, 0]) and str(df_mapping_rules.iloc[i, 0]).strip().upper() == me_state.upper()
+            and pd.notna(df_mapping_rules.iloc[i, 1])
+        ]
+        with me_col2:
+            me_form = st.selectbox("Form", me_forms, key="me_form")
+        me_rule_row = find_form_rule_row(df_mapping_rules, me_form, me_state)
+
+        # Template: configured URL first, uploaded file as fallback / override
+        me_template = None
+        me_upload = st.file_uploader(
+            "Template (optional - a blank template or a previously generated form of this type)",
+            type=["xlsx"], key=f"me_upload_{me_state}_{me_form}",
+        )
+        if me_upload is not None:
+            me_template = io.BytesIO(me_upload.getvalue())
+        else:
+            me_url = st.secrets.get("templates", {}).get(me_state, {}).get(me_form)
+            if me_url:
+                try:
+                    resp = requests.get(me_url, timeout=15)
+                    resp.raise_for_status()
+                    me_template = io.BytesIO(resp.content)
+                except Exception as exc:
+                    st.info(f"Could not fetch the configured template ({exc}). Upload one above to see its headers.")
+
+        conso_options = conso_header_options(df_col_ref)
+        conso_tags = list(conso_options.keys())
+        unit_letters_all = [get_column_letter(i + 1) for i in range(len(df_units.columns))]
+        unit_letter_labels = {get_column_letter(i + 1): f"{get_column_letter(i + 1)} · {name}" for i, name in enumerate(df_units.columns)}
+
+        if me_template is not None:
+            me_columns = get_template_columns(me_template, me_state, me_form)
+        else:
+            width = max(df_mapping_rules.shape[1] - 7, 0)
+            me_columns = [{"col": c, "letter": get_column_letter(c), "label": "(upload template to see header)"}
+                          for c in range(1, width + 1) if get_rule_for_column(df_mapping_rules, me_rule_row or 0, c)]
+
+        sample_row = filtered_df.iloc[0].to_dict() if not filtered_df.empty else (df_conso.iloc[0].to_dict() if not df_conso.empty else {})
+
+        if me_rule_row is None:
+            st.error(f"No row for {me_state} / {me_form} in Sheet1.")
+        elif not me_columns:
+            st.info("No template columns found.")
+        else:
+            st.markdown("Pick a source for each column. Leave **Keep current rule** to change nothing.")
+            head = st.columns([0.7, 2.2, 2.2, 2.2, 3.2, 2.0])
+            for h, t in zip(head, ["Col", "Template header", "Current rule", "Source", "Conso Data header(s)", "Preview (1st employee)"]):
+                h.markdown(f"**{t}**")
+
+            pending: dict[int, str] = {}
+            for entry in me_columns:
+                c = entry["col"]
+                key = f"me_{me_state}_{me_form}_{c}"
+                current = get_rule_for_column(df_mapping_rules, me_rule_row, c)
+                cols = st.columns([0.7, 2.2, 2.2, 2.2, 3.2, 2.0])
+                cols[0].write(entry["letter"])
+                cols[1].write(entry["label"])
+                cols[2].caption(f"{current or '-'}" + (f"  \n= {describe_rule(current, df_col_ref)}" if _is_col_prefixed(current) else ""))
+                kind = cols[3].selectbox("Source", RULE_KINDS, key=f"{key}_kind", label_visibility="collapsed")
+                new_rule = None
+                with cols[4]:
+                    if kind == RULE_KIND_CONSO:
+                        tag = st.selectbox("Conso header", conso_tags, format_func=lambda t: conso_options[t],
+                                           key=f"{key}_tag", label_visibility="collapsed")
+                        new_rule = build_rule_string(kind, tags=[tag])
+                    elif kind == RULE_KIND_FORMULA:
+                        n_terms = st.number_input("Terms", min_value=2, max_value=8, value=2, step=1, key=f"{key}_n")
+                        f_tags, f_ops = [], []
+                        for t_i in range(int(n_terms)):
+                            tcols = st.columns([1, 4])
+                            if t_i > 0:
+                                f_ops.append(tcols[0].selectbox("op", list(FORMULA_OPERATORS), key=f"{key}_op{t_i}", label_visibility="collapsed"))
+                            else:
+                                tcols[0].write("")
+                            f_tags.append(tcols[1].selectbox("Conso header", conso_tags, format_func=lambda t: conso_options[t],
+                                                             key=f"{key}_t{t_i}", label_visibility="collapsed"))
+                        new_rule = build_rule_string(kind, tags=f_tags, operators=f_ops)
+                    elif kind == RULE_KIND_FIXED:
+                        new_rule = build_rule_string(kind, text=st.text_input("Text", key=f"{key}_txt", label_visibility="collapsed"))
+                    elif kind == RULE_KIND_UNIT:
+                        picked = st.multiselect("Units_Master column(s)", unit_letters_all, format_func=lambda l: unit_letter_labels[l],
+                                                key=f"{key}_unit", label_visibility="collapsed")
+                        new_rule = build_rule_string(kind, unit_letters=picked)
+                    elif kind in (RULE_KIND_AUTO, RULE_KIND_WAGE_MONTH):
+                        new_rule = build_rule_string(kind)
+                    elif kind == RULE_KIND_BLANK:
+                        new_rule = ""
+                if kind != RULE_KIND_KEEP and new_rule is not None and (new_rule != "" or kind == RULE_KIND_BLANK):
+                    pending[c] = new_rule
+                    try:
+                        preview = resolve_col_rule(new_rule, df_col_ref, sample_row, 0, active_month="April", selected_year=int(selected_year),
+                                                   df_units=df_units, selected_unit=sample_row.get("Unit"))
+                    except Exception as exc:
+                        preview = f"error: {exc}"
+                    cols[5].write(str(preview) if preview not in (None, "") else "(blank)")
+                    cols[4].caption(f"Will write: `{new_rule or '(empty)'}`")
+                elif kind == RULE_KIND_KEEP and not current:
+                    hint = suggest_conso_tag(entry["label"], conso_options)
+                    if hint:
+                        cols[5].caption(f"💡 {conso_options[hint]}")
+                elif current:
+                    try:
+                        cur_val = resolve_col_rule(current, df_col_ref, sample_row, 0, active_month="April", selected_year=int(selected_year),
+                                                   df_units=df_units, selected_unit=sample_row.get("Unit"))
+                    except Exception as exc:
+                        cur_val = f"error: {exc}"
+                    cols[5].caption(str(cur_val) if cur_val not in (None, "") else "(blank)")
+
+            st.divider()
+            st.write(f"**{len(pending)}** column(s) changed for {me_state} / {me_form}.")
+            save_col, dl_col = st.columns(2)
+            with save_col:
+                if st.button("💾 Save mapping to master workbook", disabled=not pending, key="me_save"):
+                    try:
+                        updated_bytes = save_rule_edits(MASTER_FILE_PATH, me_rule_row, pending)
+                        st.session_state["me_last_saved_master"] = updated_bytes
+                        mail_ok, mail_msg = email_file_to_outlook(updated_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
+                        st.cache_data.clear()
+                        st.success(f"Saved {len(pending)} rule(s). " + (mail_msg if mail_ok else f"Local copy updated ({mail_msg}) - use the download to refresh SharePoint."))
+                    except Exception as exc:
+                        st.error(f"Could not save mapping: {exc}")
+            with dl_col:
+                if st.session_state.get("me_last_saved_master"):
+                    st.download_button(
+                        "📥 Download updated master workbook",
+                        data=st.session_state["me_last_saved_master"],
+                        file_name="Master_CONSO_DATA_ALL_UNITS.XLSX",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="me_download_master",
+                    )
+            st.caption(
+                "The new rules are used the next time a form is generated. The master workbook is stored on the "
+                "app server, so upload the downloaded copy back to SharePoint if the app is redeployed."
+            )
