@@ -131,6 +131,8 @@ def fetch_onedrive_file_with_retry(url: str, max_retries: int = 4, delay: int = 
 
 @st.cache_data(ttl=3600)
 def get_active_master_data():
+    if os.path.exists(MASTER_FILE_PATH) and not zipfile.is_zipfile(MASTER_FILE_PATH):
+        os.remove(MASTER_FILE_PATH)  # a bad earlier download; fetch again
     if not os.path.exists(MASTER_FILE_PATH):
         os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
         content = download_master_bytes(ONEDRIVE_MASTER_URL)
@@ -231,13 +233,61 @@ def _graph_master_url(cfg: dict) -> str:
     return f"https://graph.microsoft.com/v1.0/users/{cfg['drive_user']}/drive/root:/{requests.utils.quote(path)}:/content"
 
 
+def _graph_error_text(resp) -> str:
+    try:
+        body = resp.json()
+        err = body.get("error", {})
+        if isinstance(err, dict):
+            return err.get("message") or err.get("code") or resp.text[:200]
+        return (body.get("error_description") or str(err)).split("\r\n")[0]
+    except Exception:
+        return resp.text[:200]
+
+
 def graph_download_master() -> bytes | None:
     cfg = _graph_config()
     if not cfg:
         return None
-    resp = requests.get(_graph_master_url(cfg), headers={"Authorization": f"Bearer {_graph_token(cfg)}"}, timeout=60)
+    try:
+        token = _graph_token(cfg)
+    except requests.HTTPError as err:
+        raise RuntimeError(
+            "Microsoft sign-in failed (check tenant_id, client_id and client_secret in [graph] secrets; "
+            f"the secret must be the VALUE, not the Secret ID): {_graph_error_text(err.response)}"
+        ) from None
+    resp = requests.get(_graph_master_url(cfg), headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    if resp.status_code == 403 or resp.status_code == 401:
+        raise RuntimeError(
+            "Signed in, but OneDrive access was refused. IT still needs to grant Files.ReadWrite.All "
+            f"(Application) with admin consent: {_graph_error_text(resp)}"
+        )
+    if resp.status_code == 404:
+        hint = ""
+        try:
+            listing = requests.get(
+                f"https://graph.microsoft.com/v1.0/users/{cfg['drive_user']}/drive/root/children?$select=name&$top=200",
+                headers={"Authorization": f"Bearer {token}"}, timeout=30,
+            )
+            if listing.ok:
+                names = [i["name"] for i in listing.json().get("value", []) if i["name"].lower().endswith((".xlsx", ".xlsm"))]
+                hint = f" Excel files in that OneDrive's top folder: {', '.join(names) or 'none'}."
+            else:
+                hint = f" Also could not open the OneDrive of '{cfg['drive_user']}': {_graph_error_text(listing)}"
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"File '{cfg['master_path']}' was not found in the OneDrive of {cfg['drive_user']}. "
+            "master_path must match the file name exactly, including folders (e.g. Documents/HR/Master.xlsx)." + hint
+        )
     resp.raise_for_status()
     return resp.content
+
+
+def _require_xlsx(content: bytes, source: str) -> bytes:
+    if not content or not zipfile.is_zipfile(io.BytesIO(content)):
+        preview = (content or b"")[:80].decode("utf-8", "replace").strip()
+        raise RuntimeError(f"{source} returned something that is not an Excel file ({len(content or b'')} bytes, starts with: {preview!r}).")
+    return content
 
 
 def _graph_path_url(cfg: dict, rel_path: str, suffix: str) -> str:
@@ -379,14 +429,10 @@ def archive_rel_path(selected_state, selected_unit, active_month_year, filename:
 
 
 def download_master_bytes(share_url: str) -> bytes:
-    """Graph first (when configured), then the existing share-link download."""
-    try:
-        content = graph_download_master()
-        if content:
-            return content
-    except Exception:
-        pass
-    return fetch_onedrive_file_with_retry(share_url)
+    """Graph when configured (errors are shown, no silent fallback); otherwise the share link."""
+    if _graph_config():
+        return _require_xlsx(graph_download_master(), "OneDrive (Microsoft Graph)")
+    return _require_xlsx(fetch_onedrive_file_with_retry(share_url), "The OneDrive share link")
 
 
 def upload_master_to_cloud(file_bytes: bytes, filename: str = "Master_CONSO_DATA_ALL_UNITS.XLSX") -> tuple[bool, str]:
@@ -517,7 +563,7 @@ def normalize_unit_key(value: object) -> str:
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     try:
-        if Path(MASTER_FILE_PATH).exists():
+        if Path(MASTER_FILE_PATH).exists() and zipfile.is_zipfile(MASTER_FILE_PATH):
             with open(MASTER_FILE_PATH, "rb") as f:
                 file_bytes = io.BytesIO(f.read())
         else:
@@ -2538,6 +2584,9 @@ try:
 except Exception as e:
     st.error(f"❌ Failed to fetch or read Master Data from OneDrive: {e}")
     if st.button("🔄 Retry Connection to OneDrive"):
+        if os.path.exists(MASTER_FILE_PATH):
+            os.remove(MASTER_FILE_PATH)
+        _GRAPH_TOKEN_CACHE.clear()
         st.cache_data.clear()
         st.rerun()
     st.stop()
