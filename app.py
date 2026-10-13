@@ -133,7 +133,7 @@ def fetch_onedrive_file_with_retry(url: str, max_retries: int = 4, delay: int = 
 def get_active_master_data():
     if not os.path.exists(MASTER_FILE_PATH):
         os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
-        content = fetch_onedrive_file_with_retry(ONEDRIVE_MASTER_URL)
+        content = download_master_bytes(ONEDRIVE_MASTER_URL)
         with open(MASTER_FILE_PATH, "wb") as f:
             f.write(content)
             
@@ -185,29 +185,329 @@ def email_file_to_outlook(file_bytes, filename):
         return False, f"Email dispatch skipped/failed: {str(e)}"
 
 
-def write_conso_data_sheet(master_path: str, new_df: pd.DataFrame) -> None:
-    workbook = load_workbook(master_path)
-    if "Conso_Data" in workbook.sheetnames:
-        sheet_index = workbook.sheetnames.index("Conso_Data")
-        del workbook["Conso_Data"]
-        sheet = workbook.create_sheet("Conso_Data", sheet_index)
-    else:
-        sheet = workbook.create_sheet("Conso_Data")
+# ---------------------------------------------------------------------------
+# Microsoft Graph (same app-registration approach as the Travel Portal):
+# upload/download the master workbook straight to OneDrive/SharePoint instead of
+# emailing it to Outlook for Power Automate to re-save.
+#   .streamlit/secrets.toml
+#   [graph]
+#   tenant_id = "..."; client_id = "..."; client_secret = "..."
+#   drive_user = "ghiri_s@hungerpangs.com"           # OneDrive owner
+#   master_path = "Master_CONSO_DATA_ALL_UNITS.xlsx"  # path inside that OneDrive
+#   archive_folder = "HR_Compliance_Archive"           # optional: where generated forms go
+# App registration needs the Files.ReadWrite.All *application* permission (admin consent).
+# ---------------------------------------------------------------------------
+def _graph_config() -> dict | None:
+    cfg = dict(st.secrets.get("graph", {}) or {})
+    needed = ("tenant_id", "client_id", "client_secret", "drive_user", "master_path")
+    return cfg if all(cfg.get(k) for k in needed) else None
+
+
+_GRAPH_TOKEN_CACHE: dict = {}
+
+
+def _graph_token(cfg: dict) -> str:
+    cached = _GRAPH_TOKEN_CACHE.get(cfg["client_id"])
+    if cached and cached[1] > time.time() + 60:
+        return cached[0]
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{cfg['tenant_id']}/oauth2/v2.0/token",
+        data={
+            "client_id": cfg["client_id"],
+            "client_secret": cfg["client_secret"],
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    _GRAPH_TOKEN_CACHE[cfg["client_id"]] = (payload["access_token"], time.time() + int(payload.get("expires_in", 3600)))
+    return payload["access_token"]
+
+
+def _graph_master_url(cfg: dict) -> str:
+    path = str(cfg["master_path"]).strip("/")
+    return f"https://graph.microsoft.com/v1.0/users/{cfg['drive_user']}/drive/root:/{requests.utils.quote(path)}:/content"
+
+
+def graph_download_master() -> bytes | None:
+    cfg = _graph_config()
+    if not cfg:
+        return None
+    resp = requests.get(_graph_master_url(cfg), headers={"Authorization": f"Bearer {_graph_token(cfg)}"}, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _graph_path_url(cfg: dict, rel_path: str, suffix: str) -> str:
+    path = "/".join(requests.utils.quote(part) for part in str(rel_path).strip("/").split("/"))
+    return f"https://graph.microsoft.com/v1.0/users/{cfg['drive_user']}/drive/root:/{path}:{suffix}"
+
+
+def graph_archive_root() -> str:
+    cfg = _graph_config() or {}
+    return str(cfg.get("archive_folder") or "HR_Compliance_Archive").strip("/")
+
+
+def graph_upload_file(rel_path: str, file_bytes: bytes) -> tuple[bool, str]:
+    """Upload bytes to <drive_user>'s OneDrive at rel_path (folders are created as needed).
+    Returns (True, webUrl) or (False, error message)."""
+    cfg = _graph_config()
+    if not cfg:
+        return False, "Microsoft Graph is not configured"
+    try:
+        resp = requests.put(
+            _graph_path_url(cfg, rel_path, "/content"),
+            headers={"Authorization": f"Bearer {_graph_token(cfg)}", "Content-Type": "application/octet-stream"},
+            data=file_bytes,
+            timeout=120,
+        )
+        if resp.status_code == 423:
+            return False, f"{rel_path} is locked in OneDrive (open for editing). Close it and try again."
+        resp.raise_for_status()
+        return True, resp.json().get("webUrl", "")
+    except Exception as exc:
+        return False, f"Graph upload failed: {exc}"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def graph_list_folder(rel_path: str) -> dict[str, str]:
+    """{file name: OneDrive webUrl} for a folder; empty when not configured / missing."""
+    cfg = _graph_config()
+    if not cfg:
+        return {}
+    try:
+        resp = requests.get(_graph_path_url(cfg, rel_path, "/children"),
+                            headers={"Authorization": f"Bearer {_graph_token(cfg)}"}, timeout=30)
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+        return {item["name"]: item.get("webUrl", "") for item in resp.json().get("value", []) if "file" in item}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def graph_list_children(rel_path: str) -> dict:
+    """{'folders': [...names], 'files': [{'name','web_url','download_url','size_kb','modified'}]} for a OneDrive folder."""
+    cfg = _graph_config()
+    result = {"folders": [], "files": []}
+    if not cfg:
+        return result
+    url = _graph_path_url(cfg, rel_path, "/children") + "?$top=999"
+    headers = {"Authorization": f"Bearer {_graph_token(cfg)}"}
+    while url:
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 404:
+            return result
+        resp.raise_for_status()
+        payload = resp.json()
+        for item in payload.get("value", []):
+            if "folder" in item:
+                result["folders"].append(item["name"])
+            elif "file" in item:
+                result["files"].append({
+                    "name": item["name"],
+                    "web_url": item.get("webUrl", ""),
+                    "download_url": item.get("@microsoft.graph.downloadUrl", ""),
+                    "size_kb": round(item.get("size", 0) / 1024, 1),
+                    "modified": str(item.get("lastModifiedDateTime", ""))[:16].replace("T", " "),
+                })
+        url = payload.get("@odata.nextLink")
+    result["folders"].sort()
+    result["files"].sort(key=lambda f: f["name"])
+    return result
+
+
+def render_onedrive_archive() -> None:
+    """Generated Forms tab, read straight from OneDrive (survives app redeploys)."""
+    root = graph_archive_root()
+    st.caption(f"Reading live from OneDrive: `{root}/<State>/<Outlet>/<Month-Year>/`")
+    if st.button("🔄 Refresh from OneDrive", key="od_refresh"):
+        graph_list_children.clear()
+    try:
+        states = [f for f in graph_list_children(root)["folders"] if f != "Conso_Backups"]
+    except Exception as exc:
+        st.error(f"Could not read OneDrive: {exc}")
+        return
+    if not states:
+        st.info("No archived forms found in OneDrive yet. Generate a form and it will appear here.")
+        return
+    od_state = st.selectbox("Select Archived State", states, key="od_archive_state")
+    units = graph_list_children(f"{root}/{od_state}")["folders"]
+    if not units:
+        st.info("No outlets found for the selected state.")
+        return
+    od_unit = st.selectbox("Select Archived Outlet", units, key="od_archive_unit")
+    months = graph_list_children(f"{root}/{od_state}/{od_unit}")["folders"]
+    if not months:
+        st.info("No wage-month folders found for the selected outlet.")
+        return
+    od_month = st.selectbox("Select Month-Year", months, key="od_archive_month")
+    files = [f for f in graph_list_children(f"{root}/{od_state}/{od_unit}/{od_month}")["files"] if f["name"].lower().endswith(".xlsx")]
+    if not files:
+        st.info("No forms in this folder.")
+        return
+    prefix = f"{od_state}_{od_unit}_"
+    st.dataframe(
+        pd.DataFrame([{
+            "Form Name": f["name"].removesuffix(".xlsx").replace(prefix, ""),
+            "State / Region": od_state,
+            "Outlet / Brand Unit": od_unit,
+            "Wage Month": od_month,
+            "Last Updated": f["modified"],
+            "File Size (KB)": f["size_kb"],
+        } for f in files]),
+        use_container_width=True, hide_index=True,
+    )
+    st.markdown("#### Open or Download")
+    for f in files:
+        c1, c2, c3 = st.columns([3, 1, 1])
+        c1.write(f"📄 {f['name'].removesuffix('.xlsx').replace(prefix, '')}")
+        if f["web_url"]:
+            c2.link_button("☁️ Open in OneDrive", f["web_url"])
+        if f["download_url"]:
+            c3.link_button("📥 Download", f["download_url"])
+
+
+def archive_rel_path(selected_state, selected_unit, active_month_year, filename: str = "") -> str:
+    parts = [graph_archive_root(), str(selected_state), str(selected_unit), str(active_month_year)]
+    if filename:
+        parts.append(filename)
+    return "/".join(parts)
+
+
+def download_master_bytes(share_url: str) -> bytes:
+    """Graph first (when configured), then the existing share-link download."""
+    try:
+        content = graph_download_master()
+        if content:
+            return content
+    except Exception:
+        pass
+    return fetch_onedrive_file_with_retry(share_url)
+
+
+def upload_master_to_cloud(file_bytes: bytes, filename: str = "Master_CONSO_DATA_ALL_UNITS.XLSX") -> tuple[bool, str]:
+    """Put the master workbook back in OneDrive. Uses Microsoft Graph when [graph] is configured
+    (binary upload, nothing in between can mangle the file); otherwise falls back to the old
+    email -> Power Automate route."""
+    cfg = _graph_config()
+    if not cfg:
+        ok, msg = email_file_to_outlook(file_bytes, filename)
+        return ok, msg + " (via email; set up [graph] in secrets to upload directly)"
+    ok, info = graph_upload_file(cfg["master_path"], file_bytes)
+    return (True, "Uploaded to OneDrive directly via Microsoft Graph.") if ok else (False, info)
+
+
+
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _date_style_index(styles_xml: str) -> tuple[str, int]:
+    """Index of a cellXfs entry that formats dates (adds one if the workbook has none)."""
+    custom = {m.group(1): m.group(2) for m in re.finditer(r'<numFmt\b[^>]*numFmtId="(\d+)"[^>]*formatCode="([^"]*)"', styles_xml)}
+    date_ids = {"14", "15", "16", "17", "22"} | {k for k, v in custom.items() if re.search(r"[dy]", v.lower()) and "h" not in v.lower()}
+    m = re.search(r"<cellXfs\b[^>]*>(.*?)</cellXfs>", styles_xml, re.DOTALL)
+    xfs = re.findall(r"<xf\b[^>]*?(?:/>|>.*?</xf>)", m.group(1), re.DOTALL)
+    for idx, xf in enumerate(xfs):
+        fmt = re.search(r'numFmtId="(\d+)"', xf)
+        if fmt and fmt.group(1) in date_ids:
+            return styles_xml, idx
+    new_xf = '<xf numFmtId="15" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+    block = m.group(0)
+    new_block = block.replace("</cellXfs>", new_xf + "</cellXfs>")
+    new_block = re.sub(r'count="\d+"', f'count="{len(xfs) + 1}"', new_block, count=1)
+    return styles_xml.replace(block, new_block, 1), len(xfs)
+
+
+def _conso_sheet_data_xml(new_df: pd.DataFrame, date_style: int) -> tuple[str, str]:
+    """<sheetData> for Conso_Data (row 1 column letters, row 2 headers, data from row 3)."""
+    epoch = datetime(1899, 12, 30)
+
+    def text_cell(ref: str, text: str) -> str:
+        text = _XML_ILLEGAL_RE.sub("", text)
+        return f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(text)}</t></is></c>'
+
+    def value_cell(ref: str, value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, float) and pd.isna(value):
+            return ""
+        if value is pd.NaT:
+            return ""
+        if isinstance(value, bool):
+            return f'<c r="{ref}" t="b"><v>{int(value)}</v></c>'
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f'<c r="{ref}"><v>{repr(float(value)) if isinstance(value, float) else value}</v></c>'
+        if hasattr(value, "item") and not isinstance(value, str):  # numpy scalar
+            return value_cell(ref, value.item())
+        if isinstance(value, (pd.Timestamp, datetime)):
+            ts = pd.Timestamp(value).to_pydatetime().replace(tzinfo=None)
+            serial = (ts - epoch).total_seconds() / 86400
+            return f'<c r="{ref}" s="{date_style}"><v>{serial:.10g}</v></c>'
+        return text_cell(ref, str(value))
 
     columns = list(new_df.columns)
-    for col_idx, column_name in enumerate(columns, start=1):
-        sheet.cell(row=1, column=col_idx, value=get_column_letter(col_idx))
-        sheet.cell(row=2, column=col_idx, value=str(column_name))
+    rows = []
+    rows.append('<row r="1">' + "".join(text_cell(f"{get_column_letter(i)}1", get_column_letter(i)) for i in range(1, len(columns) + 1)) + "</row>")
+    rows.append('<row r="2">' + "".join(text_cell(f"{get_column_letter(i)}2", str(c)) for i, c in enumerate(columns, start=1)) + "</row>")
+    letters = [get_column_letter(i) for i in range(1, len(columns) + 1)]
+    for r_idx, row in enumerate(new_df.itertuples(index=False, name=None), start=3):
+        cells = "".join(value_cell(f"{letters[c]}{r_idx}", v) for c, v in enumerate(row))
+        rows.append(f'<row r="{r_idx}">{cells}</row>')
+    last_ref = f"{get_column_letter(max(len(columns), 1))}{len(new_df) + 2}"
+    return "<sheetData>" + "".join(rows) + "</sheetData>", last_ref
 
-    for row_offset, row in enumerate(new_df.itertuples(index=False, name=None), start=3):
-        for col_idx, value in enumerate(row, start=1):
-            if pd.isna(value):
-                value = None
-            elif hasattr(value, "isoformat"):
-                pass 
-            sheet.cell(row=row_offset, column=col_idx, value=value)
 
-    workbook.save(master_path)
+def write_conso_data_sheet(master_path: str, new_df: pd.DataFrame) -> None:
+    """Replace the Conso_Data sheet's cells inside the .xlsx package. Every other part of the
+    workbook (Sheet1 rules, Units_Master, Coloums, Excel-online metadata) is copied byte for
+    byte, so the file keeps opening in Excel Online (the old openpyxl full re-save did not)."""
+    with open(master_path, "rb") as f:
+        original = f.read()
+    zin = zipfile.ZipFile(io.BytesIO(original))
+    sheet_path = _sheet_xml_path(zin, "Conso_Data")
+    sheet_xml = zin.read(sheet_path).decode("utf-8")
+    styles_xml = zin.read("xl/styles.xml").decode("utf-8")
+    styles_xml, date_style = _date_style_index(styles_xml)
+
+    data_xml, last_ref = _conso_sheet_data_xml(new_df, date_style)
+    sd = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>.*?</sheetData>", sheet_xml, re.DOTALL)
+    new_sheet = sheet_xml[: sd.start()] + data_xml + sheet_xml[sd.end():]
+    new_sheet = re.sub(r'<dimension ref="[^"]*"\s*/>', f'<dimension ref="A1:{last_ref}"/>', new_sheet, count=1)
+    # cell-level extras that pointed at the old rows would no longer line up
+    for tag in ("mergeCells", "conditionalFormatting", "dataValidations", "hyperlinks"):
+        new_sheet = re.sub(rf"<{tag}\b.*?</{tag}>", "", new_sheet, flags=re.DOTALL)
+    new_sheet = re.sub(r"<autoFilter\b[^>]*?(?:/>|>.*?</autoFilter>)", "", new_sheet, flags=re.DOTALL)
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename == "xl/calcChain.xml":
+                continue  # Excel rebuilds it; a stale one makes Excel "repair" the file
+            if item.filename == sheet_path:
+                data = new_sheet.encode("utf-8")
+            elif item.filename == "xl/styles.xml":
+                data = styles_xml.encode("utf-8")
+            elif item.filename == "[Content_Types].xml":
+                data = re.sub(r'<Override[^>]*PartName="/xl/calcChain.xml"[^>]*/>', "", zin.read(item.filename).decode("utf-8")).encode("utf-8")
+            elif item.filename == "xl/_rels/workbook.xml.rels":
+                data = re.sub(r'<Relationship[^>]*Target="[^"]*calcChain.xml"[^>]*/>', "", zin.read(item.filename).decode("utf-8")).encode("utf-8")
+            else:
+                data = zin.read(item.filename)
+            zout.writestr(item, data)
+    new_bytes = out.getvalue()
+
+    check = pd.read_excel(io.BytesIO(new_bytes), sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
+    if len(check) != len(new_df):
+        raise RuntimeError(f"Verification failed: wrote {len(new_df)} rows, read back {len(check)}")
+
+    tmp_path = f"{master_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(new_bytes)
+    os.replace(tmp_path, master_path)
 
 
 def normalize_unit_key(value: object) -> str:
@@ -222,7 +522,7 @@ def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
                 file_bytes = io.BytesIO(f.read())
         else:
             excel_url = st.secrets.get("EXCEL_FILE_URL") or ONEDRIVE_MASTER_URL
-            content = fetch_onedrive_file_with_retry(excel_url)
+            content = download_master_bytes(excel_url)
             file_bytes = io.BytesIO(content)
             os.makedirs(os.path.dirname(MASTER_FILE_PATH), exist_ok=True)
             with open(MASTER_FILE_PATH, "wb") as f:
@@ -2075,16 +2375,117 @@ def get_rule_for_column(df_mapping_rules: pd.DataFrame, rule_row: int, col_idx: 
     return "" if pd.isna(v) else str(v).strip()
 
 
+def _sheet_xml_path(zf: zipfile.ZipFile, sheet_name: str) -> str:
+    """Zip path of a worksheet's XML (e.g. 'xl/worksheets/sheet4.xml') looked up by sheet name."""
+    wb_xml = zf.read("xl/workbook.xml").decode("utf-8")
+    rels_xml = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    m = re.search(r'<(?:\w+:)?sheet\b[^>]*\bname="' + re.escape(sheet_name) + r'"[^>]*/?>', wb_xml)
+    if not m:
+        raise KeyError(f"Sheet '{sheet_name}' not found in workbook")
+    rid = re.search(r'\br:id="([^"]+)"', m.group(0)) or re.search(r'\bid="([^"]+)"', m.group(0))
+    rel = re.search(r'<Relationship\b[^>]*\bId="' + re.escape(rid.group(1)) + r'"[^>]*>', rels_xml)
+    target = re.search(r'\bTarget="([^"]+)"', rel.group(0)).group(1)
+    target = target.lstrip("/")
+    return target if target.startswith("xl/") else "xl/" + target
+
+
+def _xml_escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _col_number(ref: str) -> int:
+    letters = re.match(r"[A-Z]+", ref).group(0)
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def _patch_sheet_xml(xml: str, row_num: int, cells: dict[int, str]) -> str:
+    """Set text cells in one row of a worksheet XML without touching anything else."""
+    def cell_xml(col: int, text: str, style: str | None) -> str:
+        ref = f"{get_column_letter(col)}{row_num}"
+        s_attr = f' s="{style}"' if style else ""
+        if text == "":
+            return f'<c r="{ref}"{s_attr}/>'
+        return f'<c r="{ref}"{s_attr} t="inlineStr"><is><t xml:space="preserve">{_xml_escape(text)}</t></is></c>'
+
+    row_re = re.compile(r'<row\b[^>]*\br="' + str(row_num) + r'"[^>]*?(?:/>|>.*?</row>)', re.DOTALL)
+    m = row_re.search(xml)
+    if m is None:  # row missing: insert it before the first later row (or at the end of sheetData)
+        new_row = f'<row r="{row_num}">' + "".join(cell_xml(c, t, None) for c, t in sorted(cells.items())) + "</row>"
+        for later in re.finditer(r'<row\b[^>]*\br="(\d+)"', xml):
+            if int(later.group(1)) > row_num:
+                return xml[: later.start()] + new_row + xml[later.start():]
+        return xml.replace("</sheetData>", new_row + "</sheetData>", 1) if "</sheetData>" in xml else xml.replace("<sheetData/>", f"<sheetData>{new_row}</sheetData>", 1)
+
+    row_xml = m.group(0)
+    if row_xml.endswith("/>"):
+        row_open, body, row_close = row_xml[:-2] + ">", "", "</row>"
+    else:
+        open_end = row_xml.index(">") + 1
+        row_open, body, row_close = row_xml[:open_end], row_xml[open_end:-len("</row>")], "</row>"
+    cell_re = re.compile(r'<c\b[^>]*\br="([A-Z]+)' + str(row_num) + r'"[^>]*?(?:/>|>.*?</c>)', re.DOTALL)
+    existing = [(mm.start(), mm.end(), _col_number(mm.group(1)), mm.group(0)) for mm in cell_re.finditer(body)]
+    todo = dict(cells)
+    out, pos = [], 0
+    for start, end, col, cxml in existing:
+        # insert new cells that belong before this one
+        for c in sorted(k for k in todo if k < col):
+            out.append(body[pos:start]); pos = start
+            out.append(cell_xml(c, todo.pop(c), None))
+        out.append(body[pos:start])
+        if col in todo:
+            style = re.search(r'\bs="(\d+)"', cxml)
+            out.append(cell_xml(col, todo.pop(col), style.group(1) if style else None))
+        else:
+            out.append(cxml)
+        pos = end
+    out.append(body[pos:])
+    for c in sorted(todo):
+        out.append(cell_xml(c, todo[c], None))
+    # keep the row's spans attribute (if any) wide enough
+    max_col = max([col for _, _, col, _ in existing] + list(cells))
+    row_open = re.sub(r'\bspans="(\d+):(\d+)"', lambda sm: f'spans="{sm.group(1)}:{max(int(sm.group(2)), max_col)}"', row_open)
+    return xml[: m.start()] + row_open + "".join(out) + row_close + xml[m.end():]
+
+
 def save_rule_edits(master_path: str, rule_row: int, edits: dict[int, str]) -> bytes:
-    """Write {template_col_idx: rule_text} into Sheet1 of the master workbook (all other
-    sheets are left as they are) and return the saved file's bytes."""
-    workbook = load_workbook(master_path)
-    sheet = workbook["Sheet1"]
-    for col_idx, rule_text in edits.items():
-        sheet.cell(row=rule_row + 1, column=col_idx + 7).value = rule_text if rule_text != "" else None
-    workbook.save(master_path)
+    """Write {template_col_idx: rule_text} into Sheet1 of the master workbook and return the
+    saved file's bytes.
+
+    Only Sheet1's XML is patched inside the .xlsx package; every other part of the file
+    (Conso_Data, Units_Master, Coloums, comments, Excel-online metadata) is copied byte for
+    byte. Re-saving the whole workbook through openpyxl dropped parts Excel Online relies on
+    and left a file SharePoint refused to open ("file format may not be matching")."""
     with open(master_path, "rb") as f:
-        return f.read()
+        original = f.read()
+    zin = zipfile.ZipFile(io.BytesIO(original))
+    sheet_path = _sheet_xml_path(zin, "Sheet1")
+    sheet_xml = zin.read(sheet_path).decode("utf-8")
+    cells = {col_idx + 7: ("" if rule_text in (None, "") else str(rule_text)) for col_idx, rule_text in edits.items()}
+    patched = _patch_sheet_xml(sheet_xml, rule_row + 1, cells)
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = patched.encode("utf-8") if item.filename == sheet_path else zin.read(item.filename)
+            zout.writestr(item, data)
+    new_bytes = out.getvalue()
+
+    # sanity check before replacing the master: must re-open and hold the new values
+    check = load_workbook(io.BytesIO(new_bytes), read_only=True)["Sheet1"]
+    row_vals = next(check.iter_rows(min_row=rule_row + 1, max_row=rule_row + 1, values_only=True))
+    for col, text in cells.items():
+        got = row_vals[col - 1] if col - 1 < len(row_vals) else None
+        if (got or "") != text:
+            raise RuntimeError(f"Verification failed for column {get_column_letter(col)}: wrote {text!r}, read {got!r}")
+
+    tmp_path = f"{master_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(new_bytes)
+    os.replace(tmp_path, master_path)
+    return new_bytes
 
 
 
@@ -2147,7 +2548,7 @@ st.sidebar.subheader("📥 Update Master Data")
 if st.sidebar.button("🔄 Sync Live Mapping Rules", type="secondary"):
     with st.spinner("Fetching latest rules from OneDrive..."):
         try:
-            content = fetch_onedrive_file_with_retry(ONEDRIVE_MASTER_URL)
+            content = download_master_bytes(ONEDRIVE_MASTER_URL)
             fresh_bytes = io.BytesIO(content)
             
             df_sheet1 = pd.read_excel(fresh_bytes, sheet_name="Sheet1", header=None, engine="openpyxl")
@@ -2269,14 +2670,17 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         with open(MASTER_FILE_PATH, "rb") as f:
             updated_master_bytes = f.read()
 
-        email_success_1, msg_1 = email_file_to_outlook(updated_master_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
+        email_success_1, msg_1 = upload_master_to_cloud(updated_master_bytes)
 
         archive_buffer = BytesIO()
         with pd.ExcelWriter(archive_buffer, engine="openpyxl") as writer:
             new_conso_df.to_excel(writer, sheet_name="Conso_Data", index=False)
         archive_buffer.seek(0)
         backup_filename = f"CONSO_DATA_{upload_month}_{upload_year}.xlsx"
-        email_success_2, msg_2 = email_file_to_outlook(archive_buffer.getvalue(), backup_filename)
+        if _graph_config():
+            email_success_2, msg_2 = graph_upload_file(f"{graph_archive_root()}/Conso_Backups/{backup_filename}", archive_buffer.getvalue())
+        else:
+            email_success_2, msg_2 = email_file_to_outlook(archive_buffer.getvalue(), backup_filename)
 
         st.cache_data.clear()
 
@@ -2327,6 +2731,14 @@ def save_form_to_archive(
     static_file_path = target_static_dir / f"{selected_state}_{selected_unit}_{form_name}_{active_month_year}.xlsx"
     with open(static_file_path, "wb") as f:
         f.write(form_bytes.getvalue())
+
+    if _graph_config():
+        ok, info = graph_upload_file(
+            archive_rel_path(selected_state, selected_unit, active_month_year, static_file_path.name), form_bytes.getvalue()
+        )
+        st.session_state.setdefault("onedrive_links", {})[form_name] = info if ok else ""
+        if not ok:
+            st.session_state.setdefault("onedrive_errors", {})[form_name] = info
 
     if ONEDRIVE_ARCHIVE_DIR:
         target_od_dir = ONEDRIVE_ARCHIVE_DIR / str(selected_state) / str(selected_unit) / active_month_year
@@ -2513,7 +2925,11 @@ with tab1:
                     active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
                     active_month_year = f"{active_month}-{selected_year}"
                     filename = f"{selected_state}_{selected_unit}_{selected_form}_{active_month_year}.xlsx"
-                    if selected_form in generated:
+                    if selected_form in generated and _graph_config():
+                        link = st.session_state.get("onedrive_links", {}).get(selected_form)
+                        status.write("☁️ Uploaded to OneDrive via Microsoft Graph." if link else
+                                     f"⚠️ {st.session_state.get('onedrive_errors', {}).get(selected_form, 'OneDrive upload failed')}")
+                    elif selected_form in generated:
                         status.write("📧 Dispatching file to Outlook for cloud OneDrive sync...")
                         email_success, email_msg = email_file_to_outlook(
                             generated[selected_form], filename
@@ -2537,6 +2953,9 @@ with tab1:
                         mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
                         key=f"dl_instant_{selected_form}",
                     )
+                    od_link = st.session_state.get("onedrive_links", {}).get(selected_form)
+                    if od_link:
+                        st.link_button(f"☁️ Open {selected_form} in OneDrive", od_link)
 
         with gen_col2:
             if st.button("Generate All Forms (ZIP)", key="generate_bulk"):
@@ -2568,12 +2987,16 @@ with tab1:
                                 )
                         zip_buffer.seek(0)
                         email_filename = f"HR_Compliance_{selected_state}_{selected_unit}_{active_month_year}.zip"
-                        status.write("📧 Dispatching archive to Outlook for cloud OneDrive sync...")
-                        email_success, email_msg = email_file_to_outlook(zip_buffer, email_filename)
-                        if email_success:
-                            status.write(f"☁️ {email_msg}")
+                        if _graph_config():
+                            n_up = sum(1 for f in generated if st.session_state.get("onedrive_links", {}).get(f))
+                            status.write(f"☁️ {n_up} of {len(generated)} form(s) uploaded to OneDrive via Microsoft Graph.")
                         else:
-                            status.caption(f"⚠️ {email_msg}")
+                            status.write("📧 Dispatching archive to Outlook for cloud OneDrive sync...")
+                            email_success, email_msg = email_file_to_outlook(zip_buffer, email_filename)
+                            if email_success:
+                                status.write(f"☁️ {email_msg}")
+                            else:
+                                status.caption(f"⚠️ {email_msg}")
                     status.update(label="✅ All forms generated and synced to OneDrive successfully!", state="complete")
                 
                 if errors:
@@ -2608,6 +3031,9 @@ with tab1:
                                 mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
                                 key=f"dl_individual_{form_name}",
                             )
+                            od_link = st.session_state.get("onedrive_links", {}).get(form_name)
+                            if od_link:
+                                st.markdown(f"[☁️ Open {form_name} in OneDrive]({od_link})")
         
         with debug_col:
             if st.button("🛠️ Run Diagnostic Data Test (All Forms)", key="run_diagnostic"):
@@ -2676,65 +3102,72 @@ with tab1:
 
 with tab2:
     st.markdown("### OneDrive Form Archive Browser")
-    if st.button("🗑️ Clear All OneDrive Archived Forms", key="clear_all_archive_forms"):
-        clear_archive_directory(STATIC_ARCHIVE_DIR)
-        if ONEDRIVE_ARCHIVE_DIR:
-            clear_archive_directory(ONEDRIVE_ARCHIVE_DIR)
-        st.success("All OneDrive archived forms were removed. Refresh the app to confirm the archive is empty.")
-
-    archived_states = sorted([d.name for d in STATIC_ARCHIVE_DIR.iterdir() if d.is_dir()])
-    if not archived_states:
-        st.info("No archived forms found in OneDrive.")
+    if _graph_config():
+        render_onedrive_archive()
     else:
-        selected_archive_state = st.selectbox("Select Archived State", archived_states, key="archive_state")
-        archive_state_dir = STATIC_ARCHIVE_DIR / selected_archive_state
-        archived_units = sorted([d.name for d in archive_state_dir.iterdir() if d.is_dir()])
-        if not archived_units:
-            st.info("No outlets found for the selected archived state.")
+        if st.button("🗑️ Clear All OneDrive Archived Forms", key="clear_all_archive_forms"):
+            clear_archive_directory(STATIC_ARCHIVE_DIR)
+            if ONEDRIVE_ARCHIVE_DIR:
+                clear_archive_directory(ONEDRIVE_ARCHIVE_DIR)
+            st.success("All OneDrive archived forms were removed. Refresh the app to confirm the archive is empty.")
+
+        archived_states = sorted([d.name for d in STATIC_ARCHIVE_DIR.iterdir() if d.is_dir()])
+        if not archived_states:
+            st.info("No archived forms found in OneDrive.")
         else:
-            selected_archive_unit = st.selectbox("Select Archived Outlet", archived_units, key="archive_unit")
-            archive_unit_dir = archive_state_dir / selected_archive_unit
-            archived_months = sorted([d.name for d in archive_unit_dir.iterdir() if d.is_dir()])
-            if not archived_months:
-                st.info("No wage-month folders found for the selected outlet.")
+            selected_archive_state = st.selectbox("Select Archived State", archived_states, key="archive_state")
+            archive_state_dir = STATIC_ARCHIVE_DIR / selected_archive_state
+            archived_units = sorted([d.name for d in archive_state_dir.iterdir() if d.is_dir()])
+            if not archived_units:
+                st.info("No outlets found for the selected archived state.")
             else:
-                selected_archive_month = st.selectbox("Select Month-Year", archived_months, key="archive_month")
-                archive_month_dir = archive_unit_dir / selected_archive_month
-                archived_files = sorted([f for f in archive_month_dir.glob("*.xlsx") if f.is_file()])
-                if not archived_files:
-                    st.info("No archived forms found for this selection.")
+                selected_archive_unit = st.selectbox("Select Archived Outlet", archived_units, key="archive_unit")
+                archive_unit_dir = archive_state_dir / selected_archive_unit
+                archived_months = sorted([d.name for d in archive_unit_dir.iterdir() if d.is_dir()])
+                if not archived_months:
+                    st.info("No wage-month folders found for the selected outlet.")
                 else:
-                    archive_df = pd.DataFrame(
-                        [
-                            {
-                                "Form Name": archive_file.stem.replace(
-                                    f"{selected_archive_state}_{selected_archive_unit}_", ""
-                                ),
-                                "State / Region": selected_archive_state,
-                                "Outlet / Brand Unit": selected_archive_unit,
-                                "Wage Month": selected_archive_month,
-                                "File Size (KB)": round(archive_file.stat().st_size / 1024, 1),
-                            }
-                            for archive_file in archived_files
-                        ]
-                    )
+                    selected_archive_month = st.selectbox("Select Month-Year", archived_months, key="archive_month")
+                    archive_month_dir = archive_unit_dir / selected_archive_month
+                    archived_files = sorted([f for f in archive_month_dir.glob("*.xlsx") if f.is_file()])
+                    if not archived_files:
+                        st.info("No archived forms found for this selection.")
+                    else:
+                        archive_df = pd.DataFrame(
+                            [
+                                {
+                                    "Form Name": archive_file.stem.replace(
+                                        f"{selected_archive_state}_{selected_archive_unit}_", ""
+                                    ),
+                                    "State / Region": selected_archive_state,
+                                    "Outlet / Brand Unit": selected_archive_unit,
+                                    "Wage Month": selected_archive_month,
+                                    "File Size (KB)": round(archive_file.stat().st_size / 1024, 1),
+                                }
+                                for archive_file in archived_files
+                            ]
+                        )
 
-                    st.dataframe(archive_df, use_container_width=True, hide_index=True)
+                        st.dataframe(archive_df, use_container_width=True, hide_index=True)
 
-                    st.markdown("#### Download Archived Forms")
-                    for archive_file in archived_files:
-                        form_label = archive_file.stem.replace(f"{selected_archive_state}_{selected_archive_unit}_", "")
-                        dl_col1, dl_col2 = st.columns([3, 1])
-                        with dl_col1:
-                            st.write(f"📄 {form_label}")
-                        with dl_col2:
-                            st.download_button(
-                                label="📥 Download",
-                                data=archive_file.read_bytes(),
-                                file_name=archive_file.name,
-                                mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
-                                key=f"archive_dl_{selected_archive_state}_{selected_archive_unit}_{selected_archive_month}_{archive_file.name}",
-                            )
+                        st.markdown("#### Download Archived Forms")
+                        od_files = graph_list_folder(archive_rel_path(selected_archive_state, selected_archive_unit, selected_archive_month)) if _graph_config() else {}
+                        for archive_file in archived_files:
+                            form_label = archive_file.stem.replace(f"{selected_archive_state}_{selected_archive_unit}_", "")
+                            dl_col1, od_col, dl_col2 = st.columns([3, 1, 1])
+                            with dl_col1:
+                                st.write(f"📄 {form_label}")
+                            with od_col:
+                                if od_files.get(archive_file.name):
+                                    st.link_button("☁️ OneDrive", od_files[archive_file.name])
+                            with dl_col2:
+                                st.download_button(
+                                    label="📥 Download",
+                                    data=archive_file.read_bytes(),
+                                    file_name=archive_file.name,
+                                    mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
+                                    key=f"archive_dl_{selected_archive_state}_{selected_archive_unit}_{selected_archive_month}_{archive_file.name}",
+                                )
 
 with tab3:
     st.markdown("###  Notice Closure Portal")
@@ -2881,7 +3314,7 @@ with tab4:
                     try:
                         updated_bytes = save_rule_edits(MASTER_FILE_PATH, me_rule_row, pending)
                         st.session_state["me_last_saved_master"] = updated_bytes
-                        mail_ok, mail_msg = email_file_to_outlook(updated_bytes, "Master_CONSO_DATA_ALL_UNITS.XLSX")
+                        mail_ok, mail_msg = upload_master_to_cloud(updated_bytes)
                         st.cache_data.clear()
                         st.success(f"Saved {len(pending)} rule(s). " + (mail_msg if mail_ok else f"Local copy updated ({mail_msg}) - use the download to refresh SharePoint."))
                     except Exception as exc:
