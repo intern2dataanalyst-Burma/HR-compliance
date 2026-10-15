@@ -9,6 +9,7 @@ import time
 import zipfile
 from copy import copy
 from datetime import datetime
+from datetime import time as dt_time
 from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
@@ -271,6 +272,24 @@ def graph_download_master() -> bytes | None:
             if listing.ok:
                 names = [i["name"] for i in listing.json().get("value", []) if i["name"].lower().endswith((".xlsx", ".xlsm"))]
                 hint = f" Excel files in that OneDrive's top folder: {', '.join(names) or 'none'}."
+                stem = re.split(r"[_ .]", str(cfg["master_path"]).split("/")[-1])[0] or "Master"
+                found = requests.get(
+                    f"https://graph.microsoft.com/v1.0/users/{cfg['drive_user']}/drive/root/search(q='{requests.utils.quote(stem)}')"
+                    "?$select=name,parentReference&$top=50",
+                    headers={"Authorization": f"Bearer {token}"}, timeout=30,
+                )
+                if found.ok:
+                    paths = []
+                    for i in found.json().get("value", []):
+                        if not i.get("name", "").lower().endswith((".xlsx", ".xlsm")):
+                            continue
+                        parent = (i.get("parentReference") or {}).get("path", "")
+                        folder = parent.split("root:", 1)[1].strip("/") if "root:" in parent else ""
+                        paths.append(f"{folder}/{i['name']}" if folder else i["name"])
+                    hint += (f" Files named like '{stem}' anywhere in that OneDrive (copy one into master_path): "
+                             f"{' | '.join(paths)}." if paths else
+                             f" No file named like '{stem}' anywhere in that OneDrive, so the master is probably in "
+                             "someone else's OneDrive or a SharePoint site (set drive_user to that owner, or move the file).")
             else:
                 hint = f" Also could not open the OneDrive of '{cfg['drive_user']}': {_graph_error_text(listing)}"
         except Exception:
@@ -370,55 +389,144 @@ def graph_list_children(rel_path: str) -> dict:
     return result
 
 
+def _graph_children_raw(cfg: dict, token: str, rel_path: str) -> tuple[list[str], list[dict]]:
+    """(folder names, file dicts) of one OneDrive folder; no Streamlit calls so it is safe in worker threads."""
+    folders, files = [], []
+    url = _graph_path_url(cfg, rel_path, "/children") + "?$top=999"
+    while url:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if resp.status_code == 404:
+            break
+        resp.raise_for_status()
+        payload = resp.json()
+        for item in payload.get("value", []):
+            if "folder" in item:
+                folders.append(item["name"])
+            elif "file" in item:
+                files.append({
+                    "name": item["name"],
+                    "web_url": item.get("webUrl", ""),
+                    "download_url": item.get("@microsoft.graph.downloadUrl", ""),
+                    "size_kb": round(item.get("size", 0) / 1024, 1),
+                    "modified": str(item.get("lastModifiedDateTime", ""))[:16].replace("T", " "),
+                })
+        url = payload.get("@odata.nextLink")
+    return folders, files
+
+
+def _month_sort_key(month_year: str) -> tuple:
+    try:
+        dt = datetime.strptime(month_year, "%B-%Y")
+        return (dt.year, dt.month)
+    except ValueError:
+        return (0, 0)
+
+
+@st.cache_data(ttl=120, show_spinner="Reading all generated forms from OneDrive...")
+def graph_list_all_archived_forms(root: str) -> list[dict]:
+    """Every generated form under <root>/<State>/<Outlet>/<Month-Year>/, one dict per file."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    cfg = _graph_config()
+    if not cfg:
+        return []
+    token = _graph_token(cfg)
+    states, _ = _graph_children_raw(cfg, token, root)
+    states = [s for s in states if s != "Conso_Backups"]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        unit_lists = list(pool.map(lambda s: _graph_children_raw(cfg, token, f"{root}/{s}")[0], states))
+        unit_paths = [(s, u) for s, units in zip(states, unit_lists) for u in units]
+        month_lists = list(pool.map(lambda su: _graph_children_raw(cfg, token, f"{root}/{su[0]}/{su[1]}")[0], unit_paths))
+        month_paths = [(s, u, m) for (s, u), months in zip(unit_paths, month_lists) for m in months]
+        file_lists = list(pool.map(lambda sum_: _graph_children_raw(cfg, token, "/".join((root,) + sum_))[1], month_paths))
+    rows = []
+    for (state, unit, month), files in zip(month_paths, file_lists):
+        prefix, suffix = f"{state}_{unit}_", f"_{month}.xlsx"
+        for f in files:
+            if not f["name"].lower().endswith(".xlsx"):
+                continue
+            form = f["name"]
+            form = form[len(prefix):] if form.startswith(prefix) else form
+            form = form[: -len(suffix)] if form.endswith(suffix) else form.removesuffix(".xlsx")
+            rows.append({"State": state, "Outlet": unit, "Month": month, "Form": form, **f})
+    rows.sort(key=lambda r: (r["State"], r["Outlet"], tuple(-x for x in _month_sort_key(r["Month"])), r["Form"]))
+    return rows
+
+
 def render_onedrive_archive() -> None:
-    """Generated Forms tab, read straight from OneDrive (survives app redeploys)."""
+    """Generated Forms tab: every form in OneDrive, grouped by State > Outlet > Month, with links."""
     root = graph_archive_root()
     st.caption(f"Reading live from OneDrive: `{root}/<State>/<Outlet>/<Month-Year>/`")
     if st.button("🔄 Refresh from OneDrive", key="od_refresh"):
+        graph_list_all_archived_forms.clear()
         graph_list_children.clear()
     try:
-        states = [f for f in graph_list_children(root)["folders"] if f != "Conso_Backups"]
+        rows = graph_list_all_archived_forms(root)
     except Exception as exc:
         st.error(f"Could not read OneDrive: {exc}")
         return
-    if not states:
+    if not rows:
         st.info("No archived forms found in OneDrive yet. Generate a form and it will appear here.")
         return
-    od_state = st.selectbox("Select Archived State", states, key="od_archive_state")
-    units = graph_list_children(f"{root}/{od_state}")["folders"]
-    if not units:
-        st.info("No outlets found for the selected state.")
+
+    all_states = sorted({r["State"] for r in rows})
+    all_months = sorted({r["Month"] for r in rows}, key=_month_sort_key, reverse=True)
+    f1, f2, f3, f4 = st.columns([1.2, 1.2, 1, 1.2])
+    pick_states = f1.multiselect("State", all_states, key="od_f_state", placeholder="All states")
+    outlet_pool = sorted({r["Outlet"] for r in rows if not pick_states or r["State"] in pick_states})
+    pick_outlets = f2.multiselect("Outlet", outlet_pool, key="od_f_outlet", placeholder="All outlets")
+    pick_months = f3.multiselect("Month", all_months, key="od_f_month", placeholder="All months")
+    search = f4.text_input("Search form", key="od_f_search", placeholder="e.g. Form XXII").strip().lower()
+    shown = [
+        r for r in rows
+        if (not pick_states or r["State"] in pick_states)
+        and (not pick_outlets or r["Outlet"] in pick_outlets)
+        and (not pick_months or r["Month"] in pick_months)
+        and (not search or search in r["Form"].lower())
+    ]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Forms", len(shown))
+    m2.metric("States", len({r["State"] for r in shown}))
+    m3.metric("Outlets", len({(r["State"], r["Outlet"]) for r in shown}))
+    m4.metric("Months", len({r["Month"] for r in shown}))
+    if not shown:
+        st.info("No forms match these filters.")
         return
-    od_unit = st.selectbox("Select Archived Outlet", units, key="od_archive_unit")
-    months = graph_list_children(f"{root}/{od_state}/{od_unit}")["folders"]
-    if not months:
-        st.info("No wage-month folders found for the selected outlet.")
+
+    link_cols = {
+        "Open": st.column_config.LinkColumn("Open", display_text="☁️ Open in OneDrive"),
+        "Download": st.column_config.LinkColumn("Download", display_text="📥 Download"),
+        "Size (KB)": st.column_config.NumberColumn("Size (KB)", format="%.1f"),
+    }
+    view = st.radio("View", ["Grouped by state", "One table"], horizontal=True, key="od_view", label_visibility="collapsed")
+    if view == "One table":
+        st.dataframe(
+            pd.DataFrame([{
+                "State": r["State"], "Outlet": r["Outlet"], "Month": r["Month"], "Form": r["Form"],
+                "Last Updated": r["modified"], "Size (KB)": r["size_kb"],
+                "Open": r["web_url"], "Download": r["download_url"],
+            } for r in shown]),
+            column_config=link_cols, use_container_width=True, hide_index=True,
+            height=min(38 * (len(shown) + 1) + 4, 720),
+        )
         return
-    od_month = st.selectbox("Select Month-Year", months, key="od_archive_month")
-    files = [f for f in graph_list_children(f"{root}/{od_state}/{od_unit}/{od_month}")["files"] if f["name"].lower().endswith(".xlsx")]
-    if not files:
-        st.info("No forms in this folder.")
-        return
-    prefix = f"{od_state}_{od_unit}_"
-    st.dataframe(
-        pd.DataFrame([{
-            "Form Name": f["name"].removesuffix(".xlsx").replace(prefix, ""),
-            "State / Region": od_state,
-            "Outlet / Brand Unit": od_unit,
-            "Wage Month": od_month,
-            "Last Updated": f["modified"],
-            "File Size (KB)": f["size_kb"],
-        } for f in files]),
-        use_container_width=True, hide_index=True,
-    )
-    st.markdown("#### Open or Download")
-    for f in files:
-        c1, c2, c3 = st.columns([3, 1, 1])
-        c1.write(f"📄 {f['name'].removesuffix('.xlsx').replace(prefix, '')}")
-        if f["web_url"]:
-            c2.link_button("☁️ Open in OneDrive", f["web_url"])
-        if f["download_url"]:
-            c3.link_button("📥 Download", f["download_url"])
+
+    expand_all = len({r["State"] for r in shown}) == 1
+    for state in sorted({r["State"] for r in shown}):
+        state_rows = [r for r in shown if r["State"] == state]
+        outlets = sorted({r["Outlet"] for r in state_rows})
+        with st.expander(f"📁 {state}  ·  {len(outlets)} outlet(s)  ·  {len(state_rows)} form(s)", expanded=expand_all):
+            for outlet in outlets:
+                outlet_rows = [r for r in state_rows if r["Outlet"] == outlet]
+                st.markdown(f"**🏬 {outlet}**")
+                st.dataframe(
+                    pd.DataFrame([{
+                        "Month": r["Month"], "Form": r["Form"], "Last Updated": r["modified"],
+                        "Size (KB)": r["size_kb"], "Open": r["web_url"], "Download": r["download_url"],
+                    } for r in outlet_rows]),
+                    column_config=link_cols, use_container_width=True, hide_index=True,
+                    height=min(38 * (len(outlet_rows) + 1) + 4, 420),
+                )
 
 
 def archive_rel_path(selected_state, selected_unit, active_month_year, filename: str = "") -> str:
@@ -902,7 +1010,80 @@ FORM_START_ROWS_BY_STATE = {
     ("WEST BENGAL", "FORM X"): 8,
     ("WEST BENGAL", "FORM XI"): 8,
     ("WEST BENGAL", "FORM XII"): 7,
+    ("KARNATAKA", "FORM F"): 13,
+    ("KARNATAKA", "FORM H"): 13,
+    ("KARNATAKA", "FORM T"): 15,
+    ("KARNATAKA", "FORM T MUSTER ROLL"): 13,
+    ("HARYANA", "FORM C"): 12,
+    ("HARYANA", "FORM D"): 12,
+    ("HARYANA", "FORM E"): 12,
+    ("HARYANA", "FORM X"): 11,
+    ("MAHARASHTRA", "FORM I"): 12,
+    ("MAHARASHTRA", "FORM II"): 13,
+    ("MAHARASHTRA", "FORM III"): 9,
+    ("MAHARASHTRA", "FORM II WAGES REGISTER"): 12,
+    ("MAHARASHTRA", "FORM IV OVERTIME REGISTER"): 10,
+    ("MAHARASHTRA", "FORM IV REGISTER OF ADVANCE"): 13,
+    ("MAHARASHTRA", "FORM 'O'"): 13,
+    ("MAHARASHTRA", "FORM 10"): 8,
+    ("DELHI", "FORM-G"): 14,
+    ("DELHI", "FORM-H"): 10,
+    ("DELHI", "FORM I REGISTER  OF LEAVE"): 9,
+    ("DELHI", "FORM I REGISTER OF FINE.XLSX"): 7,
+    ("DELHI", "FORM-II"): 8,
+    ("DELHI", "FORM-IV"): 8,
+    ("WEST BENGAL", "FORM V"): 9,
+    ("WEST BENGAL", "FORM W"): 12,
+    ("UTTARPRADESH", "FORM D"): 10,
+    ("UTTARPRADESH", "FORM G"): 13,
+    ("UTTARPRADESH", "FORM H"): 11,
+    ("UTTARPRADESH", "FORM XIV"): 11,
+    ("UTTARPRADESH", "[1][FORM XVII"): 10,
 }
+
+
+def detect_data_start_row(sheet, header_row: int, max_cols: int = 60) -> int:
+    """First row under the column-header block (multi-row headers, sub-headers and the
+    1,2,3... numbering row) that is empty across the table, i.e. where employee data
+    belongs. Rows covered by a merged header cell count as part of the header."""
+    covered: dict[int, set] = {}
+    for rng in sheet.merged_cells.ranges:
+        if rng.max_row < header_row or rng.min_row > header_row + 12:
+            continue
+        for r in range(rng.min_row, rng.max_row + 1):
+            covered.setdefault(r, set()).update(range(rng.min_col, rng.max_col + 1))
+    width = 0
+    for c in range(1, max_cols + 1):
+        if sheet.cell(row=header_row, column=c).value not in (None, "") or c in covered.get(header_row, ()):
+            width = c
+    width = max(width, 3)
+
+    def row_has_content(r: int) -> bool:
+        if covered.get(r) and any(c <= width for c in covered[r]):
+            return True
+        return any(str(sheet.cell(row=r, column=c).value or "").strip() for c in range(1, width + 1))
+
+    r = header_row + 1
+    while r <= header_row + 12 and row_has_content(r):
+        r += 1
+    return r
+
+
+# Forms whose first data row cannot be read off the template (special layouts).
+FORM_START_ROW_OVERRIDES = {
+    ("MAHARASHTRA", "FORM 10"): 8,        # maternity: data replaces the template's NIL row
+    ("UTTARPRADESH", "FORM G"): 13,       # template carries sample rows in BB..BJ
+    ("CHANDIGARH", "FORM A"): 18,         # rows under 'Other Persons' (young persons block above)
+}
+
+
+def resolve_data_start_row(sheet, header_row: int, selected_state: str | None, form_name: str | None) -> int:
+    """First employee row: straight under the template's header and numbering rows, so no
+    blank rows are left above the data."""
+    key = (str(selected_state or "").strip().upper(), str(form_name or "").strip().upper())
+    if key in FORM_START_ROW_OVERRIDES:
+        return FORM_START_ROW_OVERRIDES[key]
+    return detect_data_start_row(sheet, header_row)
 
 
 def get_form_start_row(selected_state: str | None, form_name: str | None, default: int = 9) -> int:
@@ -1186,6 +1367,91 @@ def _refresh_month_in_text(text: str, active_month: str | None, selected_year: i
     return pattern.sub(lambda m: f"{m.group(1)}{month_name} {year_value}", text)
 
 
+# '(Fixed Text)', '(Fix Text)', '- Fixed Text', '(FT)', '( FT )' and a trailing ' FT' all mean "print the text only"
+FIXED_TEXT_MARKER_RE = re.compile(
+    r"[\(\-]?\s*\bfix(?:ed)?\s*text\b\s*\)?|\s*\(\s*ft\s*\)|(?:\s+|\s*-\s*)ft\s*$", re.IGNORECASE
+)
+# '1st Day of Month', 'First Date of the month', 'Fist Day of Month' (typo), 'Last Date of the month'
+FIRST_DAY_RULE_RE = re.compile(r"\b(?:1st|first|fist)\s+(?:day|date)\b")
+LAST_DAY_RULE_RE = re.compile(r"\blast\s+(?:day|date)\b")
+
+
+def _format_time_value(value: dt_time) -> str:
+    """Excel time (working hours) -> '11:30 AM', not '11:30:00'."""
+    return value.strftime("%I:%M %p").lstrip("0")
+
+
+def _month_day_rule_value(lowered_rule: str, active_month: str | None, selected_year: int | None) -> datetime | None:
+    """First/last day of the selected month as a real date (shown in the template cell's own
+    date format, DD-MMM-YYYY when the cell has none), or None if the rule is not one."""
+    if "month" not in lowered_rule or "previous" in lowered_rule:
+        return None
+    is_first = bool(FIRST_DAY_RULE_RE.search(lowered_rule))
+    is_last = bool(LAST_DAY_RULE_RE.search(lowered_rule))
+    if not (is_first or is_last):
+        return None
+    active_month_name = active_month if active_month not in {"All", "", None} else "July"
+    year_value = selected_year if selected_year is not None else datetime.now().year
+    try:
+        month_num = datetime.strptime(active_month_name[:3], "%b").month
+    except ValueError:
+        month_num = datetime.now().month
+    day = 1 if is_first else calendar.monthrange(int(year_value), month_num)[1]
+    return datetime(int(year_value), month_num, day)
+
+
+_ONES = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve",
+         "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+_TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+
+
+def _words_below_1000(n: int) -> str:
+    parts = []
+    if n >= 100:
+        parts.append(f"{_ONES[n // 100]} Hundred")
+        n %= 100
+    if n >= 20:
+        parts.append(_TENS[n // 10] + (f" {_ONES[n % 10]}" if n % 10 else ""))
+    elif n:
+        parts.append(_ONES[n])
+    return " ".join(parts)
+
+
+def amount_in_words(amount) -> str:
+    """Rupee amount in Indian words, e.g. 20908 -> 'Twenty Thousand Nine Hundred Eight Only'."""
+    try:
+        rupees = int(round(float(amount)))
+    except (TypeError, ValueError):
+        return ""
+    if rupees == 0:
+        return "Zero Only"
+    words = []
+    for size, name in ((10_000_000, "Crore"), (100_000, "Lakh"), (1000, "Thousand")):
+        if rupees >= size:
+            words.append(f"{_words_below_1000(rupees // size) if name != 'Crore' else amount_in_words(rupees // size).removesuffix(' Only')} {name}")
+            rupees %= size
+    if rupees:
+        words.append(_words_below_1000(rupees))
+    return " ".join(words) + " Only"
+
+
+IN_WORDS_RULE_RE = re.compile(r"\bin\s*words\b", re.IGNORECASE)
+
+
+def _outlet_short_name(unit_name: str) -> str:
+    """'Delhi Saket' -> 'Saket', 'Delhi-Aerocity' -> 'Aerocity', 'Mumbai BKC Jio World' -> 'BKC Jio World'."""
+    parts = re.split(r"[\s\-]+", str(unit_name or "").strip(), maxsplit=1)
+    return parts[1].strip() if len(parts) == 2 and parts[1].strip() else str(unit_name or "").strip()
+
+
+def _fill_outlet_placeholders(text: str, selected_unit: str | None) -> str:
+    """'{Outlet}' -> outlet short name, '{Unit}' -> full unit name, in fixed-text rules."""
+    if "{" not in text:
+        return text
+    text = re.sub(r"\{\s*outlet\s*\}", _outlet_short_name(selected_unit), text, flags=re.IGNORECASE)
+    return re.sub(r"\{\s*unit\s*\}", str(selected_unit or "").strip(), text, flags=re.IGNORECASE)
+
+
 def resolve_col_rule(
     rule_str: object,
     df_col_ref: pd.DataFrame | None,
@@ -1202,15 +1468,20 @@ def resolve_col_rule(
     rule_text = str(rule_str).strip()
     if not rule_text:
         return ""
+    rule_text = _fill_outlet_placeholders(rule_text, selected_unit)
 
     if EMBEDDED_COL_REF_RE.search(rule_text):
         rule_text = _substitute_embedded_col_refs(rule_text, df_col_ref, row_data)
 
     lowered_rule = rule_text.lower()
 
-    if "fixed text" in lowered_rule:
-        cleaned = re.sub(r"[\(\-]?\s*fixed\s*text\s*\)?", "", rule_text, flags=re.IGNORECASE)
-        return _refresh_month_in_text(cleaned.strip(" -"), active_month, selected_year)
+    if FIXED_TEXT_MARKER_RE.search(rule_text):
+        cleaned = FIXED_TEXT_MARKER_RE.sub("", rule_text).strip(" -")
+        # '1st Day of Month (FT)' still means the date, not the words
+        month_day = _month_day_rule_value(cleaned.lower(), active_month, selected_year)
+        if month_day is not None:
+            return month_day
+        return _refresh_month_in_text(cleaned, active_month, selected_year)
 
     if lowered_rule == "auto_generated" or lowered_rule.startswith("auto"):
         return idx + 1
@@ -1228,10 +1499,9 @@ def resolve_col_rule(
         month_num = datetime.now().month
     days_in_month = calendar.monthrange(int(year_value), month_num)[1]
 
-    if "1st day" in lowered_rule and "month" in lowered_rule:
-        return datetime(int(year_value), month_num, 1).strftime("%d-%b-%Y")
-    if "last day" in lowered_rule and "month" in lowered_rule:
-        return datetime(int(year_value), month_num, days_in_month).strftime("%d-%b-%Y")
+    month_day = _month_day_rule_value(lowered_rule, active_month, selected_year)
+    if month_day is not None:
+        return month_day
     if "days in cal" in lowered_rule:
         return days_in_month
 
@@ -1242,6 +1512,10 @@ def resolve_col_rule(
             match = re.search(r"col_([a-z]+)", part.strip(), flags=re.IGNORECASE)
             if match:
                 value = get_unit_master_column_value(df_units, selected_unit, match.group(1))
+                if isinstance(value, dt_time):
+                    value = _format_time_value(value)
+                elif isinstance(value, str) and re.fullmatch(r"\s*\d{1,2}[.:]\d{2}\s*[ap]\.?m\.?\s*", value, flags=re.IGNORECASE):
+                    value = re.sub(r"(?i)\s*(\d{1,2})[.:](\d{2})\s*([ap])\.?m\.?\s*", lambda m: f"{m.group(1)}:{m.group(2)} {m.group(3).upper()}M", value)
                 if value not in (None, ""):
                     resolved_parts.append(str(value).strip())
         return ", ".join(resolved_parts)
@@ -1386,7 +1660,7 @@ def _coerce_numeric_for_write(value):
         if not stripped:
             return value
         unsigned = stripped[1:] if stripped.startswith("-") else stripped
-        if re.fullmatch(r"\d+", unsigned) and not unsigned.startswith("0"):
+        if re.fullmatch(r"\d+", unsigned) and (not unsigned.startswith("0") or unsigned == "0"):
             try:
                 return int(stripped)
             except ValueError:
@@ -1409,15 +1683,19 @@ def _coerce_numeric_for_write(value):
 def safe_write(sheet, cell_coordinate: str, value) -> None:
     cell = sheet[cell_coordinate]
     value = _coerce_numeric_for_write(value)
+    if isinstance(value, float):
+        value = round(value, 2)
 
     # Prevent scientific notation (e.g., 1.7991E+15) for large IDs like UAN/Accounts/Signatures,
     # and give whole numbers a clean '0' display format (no decimals, no thousands separator,
     # so a narrow column shows the real digits instead of "##").
     is_whole_number = isinstance(value, int) and not isinstance(value, bool)
     is_long_number = value is not None and str(value).strip().lstrip('-').isdigit() and len(str(value).strip().lstrip('-')) >= 10
-    if is_whole_number or is_long_number:
+    # keep the template's own number format (e.g. #,##0.00); only replace General/text/date formats
+    keeps_template_format = _is_plain_number_format(cell.number_format)
+    if is_long_number or (is_whole_number and not keeps_template_format):
         cell.number_format = '0'
-    elif isinstance(value, float):
+    elif isinstance(value, float) and not keeps_template_format:
         cell.number_format = '0.##'
 
     if isinstance(cell, MergedCell):
@@ -1429,8 +1707,28 @@ def safe_write(sheet, cell_coordinate: str, value) -> None:
                     sheet[top_left_coord].number_format = '0'
                 elif isinstance(value, float):
                     sheet[top_left_coord].number_format = '0.##'
+                _apply_date_only_format(sheet[top_left_coord], value)
                 return
     cell.value = value
+    _apply_date_only_format(cell, value)
+
+
+def _is_plain_number_format(fmt) -> bool:
+    """True for a real numeric display format worth keeping (not General, text, or a date)."""
+    fmt = str(fmt or "General")
+    if fmt in ("General", "@"):
+        return False
+    return not re.search(r"[dmyhs]", re.sub(r'"[^"]*"|\[[^\]]*\]', "", fmt).lower())
+
+
+def _apply_date_only_format(cell, value) -> None:
+    """A midnight datetime (joining date etc.) shows as DD-MMM-YYYY, not 'yyyy-mm-dd h:mm:ss'.
+    A template's own date-only format (e.g. D/M/YYYY) is kept."""
+    if not isinstance(value, datetime) or (value.hour, value.minute, value.second, value.microsecond) != (0, 0, 0, 0):
+        return
+    fmt = str(cell.number_format or "General")
+    if fmt in ("General", "@") or "h" in fmt.lower() or _is_plain_number_format(fmt):
+        cell.number_format = "DD-MMM-YYYY"
 
 
 TEMPLATE_MARKER_FILLS = {"FFBDD6EE", "FFFFFF00", "FF9CC2E5"}
@@ -1449,6 +1747,12 @@ def detect_table_end_row(sheet, start_row: int, max_scan: int = 500) -> int:
             value = sheet.cell(row=row_idx, column=col_idx).value
             if value is not None and "TOTAL" in str(value).strip().upper():
                 return row_idx
+        # the template's own pre-printed total row further right ('Total' | =SUM(AM11:AM81) ...),
+        # e.g. Delhi Form-H AL82 / Form-IV M80: it is part of the template table, so it gets cleared
+        row_values = [sheet.cell(row=row_idx, column=c).value for c in range(11, sheet.max_column + 1)]
+        if any(str(v).strip().upper().rstrip(" :=") in ("TOTAL", "GRAND TOTAL") for v in row_values if v is not None) \
+                and any(str(v).replace(" ", "").upper().startswith("=SUM(") for v in row_values if v is not None):
+            return row_idx
 
     last_marked_row = start_row
     blank_streak = 0
@@ -1513,7 +1817,7 @@ def _split_label_value(text: str) -> tuple[str, str | None, str]:
 
 def _classify_header_label(label: str) -> str | None:
     """Which injectable field is this template label asking for?
-    Returns 'est_name', 'est_name_address', 'address', 'employer_address' or None.
+    Returns 'est_name', 'est_name_address', 'address', 'employer_address', 'registration' or None.
     Table column headers are never passed in (callers only scan rows above the table)."""
     n = normalize_header(label)
     if not n or len(n) > 80:
@@ -1530,7 +1834,29 @@ def _classify_header_label(label: str) -> str | None:
         return "est_name"
     if has_addr and (n.startswith("address") or n.startswith("addressofthe")):
         return "address"
+    if n.startswith(("registrationno", "registationno", "regnno", "regdno")):
+        return "registration"
     return None
+
+
+_KNOWN_LABEL_RE = re.compile(
+    r"^\s*(name\s+of\s+(?:the\s+)?(?:establishment|shop|factory)|address\s+of\s+(?:the\s+)?establishment"
+    r"|regis?tration\s+no\.?|regn\.?\s*no\.?)(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_known_label(label: str) -> tuple[str, str]:
+    """A label with no ':' whose text runs on past a known label:
+    'Name of the establishment OLD NAME' -> ('Name of the establishment', 'OLD NAME'),
+    'Registration No........' -> ('Registration No', '........'). Otherwise (label, '')."""
+    m = _KNOWN_LABEL_RE.match(label)
+    if not m:
+        return label, ""
+    tail = m.group(2).strip()
+    if not tail or re.match(r"(?:and\b|&|/|or\b|with\b|\()", tail, re.IGNORECASE) or "address" in tail.lower():
+        return label, ""
+    return m.group(1).strip(), tail
 
 
 def _merged_end_col(sheet, row: int, col: int) -> int:
@@ -1540,13 +1866,45 @@ def _merged_end_col(sheet, row: int, col: int) -> int:
     return col
 
 
-def _find_value_cell(sheet, row: int, col: int, max_reach: int = 12):
+_EDN_ANCHOR_RE = re.compile(r"^\s*_edn(?:ref)?\d+\s*$", re.IGNORECASE)
+_FOOTNOTE_MARK_RE = re.compile(r"\s*\[\d+\]\s*")
+
+
+def _clean_template_artefacts(sheet, header_row: int, form_name: str | None) -> None:
+    """Word-to-Excel leftovers in the blank templates: a cell holding only '_edn1' / '_ednref1'
+    (row-1 title -> the form name, e.g. 'FORM XVII'; anywhere else -> cleared) and '[1]' footnote
+    markers inside the title block (' [1][See Rules 12(8)...]' -> '[See Rules 12(8)...]')."""
+    form_title = _FOOTNOTE_MARK_RE.sub("", str(form_name or "")).strip(" [")  # '[1][FORM XVII' -> 'FORM XVII'
+    for row in sheet.iter_rows():
+        for cell in row:
+            if isinstance(cell, MergedCell) or not isinstance(cell.value, str):
+                continue
+            if _EDN_ANCHOR_RE.match(cell.value):
+                cell.hyperlink = None  # its internal link would put 'Google_Sheet_Link_...' back in the cell
+                cell.value = form_title.upper() if cell.row == 1 and form_title else None
+            elif cell.row < header_row and _FOOTNOTE_MARK_RE.search(cell.value):
+                cell.value = _FOOTNOTE_MARK_RE.sub(" ", cell.value).strip() or None
+
+
+def _template_table_width(sheet, header_row: int) -> int:
+    """Last column of the data table: the right edge (incl. merged ranges) of the header block
+    (header row + 2 sub-header/numbering rows). Falls back to the old 51-column cap."""
+    width = 0
+    for r in range(header_row, header_row + 3):
+        for c in range(1, sheet.max_column + 1):
+            if sheet.cell(row=r, column=c).value not in (None, ""):
+                width = max(width, _merged_end_col(sheet, r, c))
+    return width or min(sheet.max_column, 51)
+
+
+def _find_value_cell(sheet, row: int, col: int, max_reach: int = 12, max_col: int | None = None):
     """The cell that holds (or should hold) the value for a label-only cell: the first
     non-empty plain value to the right of the label's merged range, otherwise the first
-    empty writable cell. Stops at the next label (text ending in ':')."""
+    empty writable cell. Stops at the next label (text ending in ':') and never goes past
+    max_col (the table's right edge)."""
     start = _merged_end_col(sheet, row, col) + 1
     first_empty = None
-    for c in range(start, min(sheet.max_column, start + max_reach) + 1):
+    for c in range(start, min(sheet.max_column, max_col or sheet.max_column, start + max_reach) + 1):
         cell = sheet.cell(row=row, column=c)
         val = cell.value
         if val is None or (isinstance(val, str) and not val.strip()):
@@ -1588,7 +1946,14 @@ def get_header_values(unit_master_details: dict[str, str], df_units=None, select
             employer = str(get_unit_master_column_value(df_units, selected_unit, "N") or "").strip()
         except Exception:
             employer = ""
-    return {"est_name": est, "address": address, "employer_address": employer or address, "unit": unit}
+    registration = ""
+    if df_units is not None and selected_unit:
+        try:
+            registration = str(get_unit_master_column_value(df_units, selected_unit, "L") or "").strip()
+        except Exception:
+            registration = ""
+    return {"est_name": est, "address": address, "employer_address": employer or address, "unit": unit,
+            "registration": registration}
 
 
 def _header_write(sheet, coordinate: str, value) -> None:
@@ -1607,7 +1972,8 @@ def _header_write(sheet, coordinate: str, value) -> None:
 
 
 def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selected_year,
-                           header_row: int | None = None, values: dict[str, str] | None = None) -> list[str]:
+                           header_row: int | None = None, values: dict[str, str] | None = None,
+                           max_col: int | None = None) -> list[str]:
     """Write establishment name / address (and employer name+address) into the sheet's title
     block. Works on the rows ABOVE the data-table header only, so table column headings such as
     'Name & Address of nominee' are never touched. Handles both layouts:
@@ -1647,7 +2013,7 @@ def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selec
             # templates already carry the employer's name/address -- only fill an empty slot
             if existing:
                 continue
-            target = _find_value_cell(sheet, cell.row, cell.column)
+            target = _find_value_cell(sheet, cell.row, cell.column, max_col=max_col)
             if target is not None and target.value in (None, ""):
                 _header_write(sheet, target.coordinate, value)
                 log.append(f"{cell.coordinate}: {kind} -> {target.coordinate}")
@@ -1656,8 +2022,14 @@ def inject_dynamic_headers(sheet, unit_name, unit_address, selected_month, selec
             _header_write(sheet, cell.coordinate, f"{label}{sep if sep.strip() else ': '}{value}")
             log.append(f"{cell.coordinate}: {kind} (in place)")
             continue
-        target = _find_value_cell(sheet, cell.row, cell.column)
-        if target is not None:
+        known_label, tail = _split_known_label(label)
+        if tail:  # 'Name of the establishment OLD NAME' / 'Registration No.....' -> replaced in place
+            _header_write(sheet, cell.coordinate, f"{known_label}: {value}")
+            log.append(f"{cell.coordinate}: {kind} (tail replaced in place)")
+            continue
+        target = _find_value_cell(sheet, cell.row, cell.column, max_col=max_col)
+        # an empty slot only takes the value when the label ends in ':'; else write in place
+        if target is not None and (target.value not in (None, "") or sep.strip() or label.rstrip().endswith(":")):
             _header_write(sheet, target.coordinate, value)
             log.append(f"{cell.coordinate}: {kind} -> {target.coordinate}")
         else:
@@ -1784,6 +2156,10 @@ def write_header_month(sheet, selected_month: str, selected_year: int | None = N
             # label-only cell: find the month value cell to its right (outside any merge)
             label_text, existing, sep = _split_label_value(value)
             if len(norm) > 30 and not existing:
+                # a title such as 'Muster Roll cum Wages Register for the month of' -> month appended
+                if re.search(r"\bmonth\s+of\s*[:\-–]*\s*$", value, re.IGNORECASE):
+                    _header_write(sheet, cell.coordinate, f"{value.rstrip()} {month_label}")
+                    done_rows.add(row_idx)
                 continue
             if existing:  # 'Month: <something not a month>' -> overwrite value
                 _header_write(sheet, cell.coordinate, f"{label_text}{sep if sep.strip() else ': '}{month_label}")
@@ -1818,11 +2194,30 @@ def write_header_month(sheet, selected_month: str, selected_year: int | None = N
                     break
 
 
-def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year: int) -> None:
+def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year: int,
+                      selected_state: str | None = None) -> None:
+    """Form-specific title dates. The Form A/E/IV/V branches below were written for Chandigarh;
+    other states reuse those form names with different layouts, so they only run for Chandigarh."""
     if selected_month in {"All", "", None}:
         selected_month = "July"
     year_suffix = str(selected_year)[-2:]
     month_label = f"{selected_month[:3]}-{year_suffix}"
+    state_key = str(selected_state).strip().upper() if selected_state else ""
+
+    if state_key == "WEST BENGAL" and str(form_name).strip().upper() == "FORM V":
+        # 'For the period ending - ' | <date>: the period END is the last day of the month
+        first = _first_of_month(selected_month, selected_year)
+        last_day = datetime(first.year, first.month, calendar.monthrange(first.year, first.month)[1])
+        for row_idx in range(1, 8):
+            label_cell = sheet.cell(row=row_idx, column=1)
+            if isinstance(label_cell.value, str) and "period ending" in label_cell.value.lower():
+                target = _find_value_cell(sheet, row_idx, 1)
+                if target is not None:
+                    _header_write(sheet, target.coordinate, last_day)
+                break
+        return
+    if selected_state is not None and state_key != "CHANDIGARH":
+        return
 
     if form_name == "Form A":
         cell_a8 = sheet["A8"]
@@ -1856,7 +2251,7 @@ def verify_generated_form(
     except Exception as exc:
         return [f"Unable to open generated workbook for QA: {exc}"]
 
-    start_row = get_form_start_row(selected_state, form_name, default=15)
+    start_row = resolve_data_start_row(sheet, find_header_row(sheet), selected_state, form_name)
     known_codes = known_codes or set()
 
     for row_idx in range(1, start_row):
@@ -1927,17 +2322,46 @@ def _is_numeric_or_formula_value_for_totals(value: object) -> bool:
 NON_SUMMABLE_HEADER_TOKENS = {
     "signature", "account", "aadhar", "aadhaar", "pan", "uan", "regn",
     "registration", "licence", "license", "mobile", "phone", "ward", "circle",
-    "number", "code", "serial",
+    "number", "code", "serial", "ticket", "badge", "token",
 }
+# per-hour / per-day / monthly rates (Normal rate, Over-time rate, Rate of wages) mean nothing summed;
+# earnings columns titled 'Rate of H.R.A.' / 'Rate of D.A.' / allowances are real amounts and stay summed
+_RATE_HEADER_RE = re.compile(r"\brate\b", re.IGNORECASE)
+_RATE_AMOUNT_HEADER_RE = re.compile(r"h\.?\s*r\.?\s*a\b|\bd\.?\s*a\b|allowance", re.IGNORECASE)
 
 def _is_identifier_header(header_value: object) -> bool:
     header_raw = str(header_value or "").lower()
     tokens = set(re.findall(r"[a-z]+", header_raw))
-    return bool(tokens & NON_SUMMABLE_HEADER_TOKENS) or "a/c" in header_raw
+    is_rate = bool(_RATE_HEADER_RE.search(header_raw)) and not _RATE_AMOUNT_HEADER_RE.search(header_raw)
+    return bool(tokens & NON_SUMMABLE_HEADER_TOKENS) or "a/c" in header_raw or is_rate
 
 def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int, data_col_count: int) -> int:
+    """Bold SUM row under the data. Returns the totals row, or last_data_row when no column
+    has anything to sum (then no 'Total' row is written at all)."""
     totals_row_idx = last_data_row + 1
     label_written = False
+
+    sum_columns = set()
+    populated_columns = set()
+    for col_idx in range(3, data_col_count + 1):
+        header_text = sheet.cell(row=header_row, column=col_idx).value
+        is_identifier_column = _is_identifier_header(header_text)
+
+        column_values = [
+            sheet.cell(row=r, column=col_idx).value for r in range(start_row, last_data_row + 1)
+        ]
+        populated_values = [v for v in column_values if v is not None and str(v).strip() != ""]
+        if populated_values:
+            populated_columns.add(col_idx)
+
+        if (
+            not is_identifier_column
+            and populated_values
+            and all(_is_numeric_or_formula_value_for_totals(v) for v in populated_values)
+        ):
+            sum_columns.add(col_idx)
+    if not sum_columns:
+        return last_data_row
 
     for col_idx in range(1, data_col_count + 1):
         col_letter = get_column_letter(col_idx)
@@ -1951,22 +2375,10 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
         if col_idx <= 2:
             continue
 
-        header_text = sheet.cell(row=header_row, column=col_idx).value
-        is_identifier_column = _is_identifier_header(header_text)
-
-        column_values = [
-            sheet.cell(row=r, column=col_idx).value for r in range(start_row, last_data_row + 1)
-        ]
-        populated_values = [v for v in column_values if v is not None and str(v).strip() != ""]
-
-        if (
-            not is_identifier_column
-            and populated_values
-            and all(_is_numeric_or_formula_value_for_totals(v) for v in populated_values)
-        ):
+        if col_idx in sum_columns:
             target_cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{last_data_row})"
             target_cell.font = Font(name=source_cell.font.name, size=source_cell.font.size, bold=True)
-        elif not label_written and populated_values:
+        elif not label_written and col_idx in populated_columns:
             target_cell.value = "Total"
             target_cell.font = Font(name=source_cell.font.name, size=source_cell.font.size, bold=True)
             label_written = True
@@ -2067,9 +2479,7 @@ def run_diagnostic_mapping_test(form_name, filtered_df, df_mapping_rules, df_col
     header_row = find_header_row(sheet)
     header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 52)]
     
-    start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
-    if _looks_like_numbering_row(sheet, start_row):
-        start_row += 1
+    start_row = resolve_data_start_row(sheet, header_row, selected_state, form_name)
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
     
     logs = []
@@ -2164,6 +2574,8 @@ def generate_dynamic_form(
 
     unit_master_details = get_unit_master_details(df_units, selected_unit)
     header_row = find_header_row(sheet)
+    table_width = _template_table_width(sheet, header_row)
+    _clean_template_artefacts(sheet, header_row, form_name)
 
     write_header_month(sheet, selected_month, selected_year, header_row=header_row)
     inject_dynamic_headers(
@@ -2174,26 +2586,41 @@ def generate_dynamic_form(
         selected_year,
         header_row=header_row,
         values=get_header_values(unit_master_details, df_units, selected_unit),
+        max_col=table_width,
     )
     if form_name:
-        inject_form_dates(sheet, form_name, selected_month, selected_year)
+        inject_form_dates(sheet, form_name, selected_month, selected_year, selected_state)
 
-    header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, 51)]
+    header_cells = [sheet.cell(row=header_row, column=col_idx).value for col_idx in range(1, table_width + 1)]
 
     form_key = str(form_name).strip().upper() if form_name else ""
-    start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
-    if _looks_like_numbering_row(sheet, start_row):
-        start_row += 1
+    start_row = resolve_data_start_row(sheet, header_row, selected_state, form_name)
     _clear_internal_annotation_row(sheet, start_row - 1)
     table_end_row = detect_table_end_row(sheet, start_row)
+
+    # Maternity register (e.g. Maharashtra Form 10): only women who took maternity leave.
+    # None -> no rows and no totals; the template's own 'No eligible employee | NIL' row stays.
+    keep_template_rows = False
+    title_text = " ".join(
+        str(sheet.cell(row=r, column=c).value or "") for r in range(1, header_row) for c in range(1, 6)
+    ).lower()
+    if "maternity" in title_text and "Gender" in filtered_df.columns:
+        is_female = filtered_df["Gender"].astype(str).str.strip().str.upper().str.startswith("F")
+        if "Maternity Leave" in filtered_df.columns:
+            is_female &= pd.to_numeric(filtered_df["Maternity Leave"], errors="coerce").fillna(0) > 0
+        filtered_df = filtered_df[is_female]
+        keep_template_rows = filtered_df.empty
     row_count = len(filtered_df)
 
     active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
     month_label = f"{active_month[:3]}-{str(selected_year)[-2:]}"
-    wage_month_columns = {"Form E": "E", "Form D": "F"}
+    # Chandigarh only: UP 'Form D' column F is the deduction amount, not a wage month
+    wage_month_columns = (
+        {"Form E": "E", "Form D": "F"} if str(selected_state or "").strip().upper() in ("", "CHANDIGARH") else {}
+    )
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
 
-    data_col_count = min(sheet.max_column, 51)
+    data_col_count = table_width
 
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
@@ -2214,10 +2641,16 @@ def generate_dynamic_form(
                 rule_col_index = col_idx + 6
                 if rule_col_index < df_mapping_rules.shape[1]:
                     candidate = df_mapping_rules.iloc[form_rule_row, rule_col_index]
-                    if pd.notna(candidate) and str(candidate).strip():
+                    if isinstance(candidate, dt_time):  # a time typed straight into Sheet1 (MH Form II H/J/K)
+                        rule_value = _format_time_value(candidate)
+                    elif pd.notna(candidate) and str(candidate).strip():
                         rule_value = str(candidate).strip()
 
-            if rule_value:
+            if rule_value and IN_WORDS_RULE_RE.search(rule_value):
+                amount = (resolve_formula_rule(IN_WORDS_RULE_RE.sub("", rule_value).replace("convert", "").replace("Convert", "").strip(), df_col_ref, row)
+                          if _is_col_prefixed(re.sub(r"(?i)^\s*convert\s*", "", rule_value)) else sheet.cell(row=row_idx, column=col_idx - 1).value)
+                cell_value = amount_in_words(amount) if amount not in (None, "") else ""
+            elif rule_value:
                 cell_value = resolve_col_rule(
                     rule_value,
                     df_col_ref,
@@ -2258,7 +2691,7 @@ def generate_dynamic_form(
 
     # Clear remaining unused template rows inside the blue/yellow boundary (Leaves footers untouched)
     clear_start_row = totals_row_idx + 1
-    if table_end_row >= clear_start_row:
+    if table_end_row >= clear_start_row and not keep_template_rows:
         amount_to_delete = table_end_row - clear_start_row + 1
         sheet.delete_rows(clear_start_row, amount_to_delete)
 
@@ -2380,8 +2813,10 @@ def get_template_columns(template_bytes, selected_state: str | None, form_name: 
     template_bytes.seek(0)
     sheet = load_workbook(template_bytes).active
     header_row = find_header_row(sheet)
-    start_row = get_form_start_row(selected_state, form_name, default=max(header_row + 2, 15))
+    start_row = resolve_data_start_row(sheet, header_row, selected_state, form_name)
     last_header_row = max(header_row, start_row - 1)
+    if last_header_row > header_row and _looks_like_numbering_row(sheet, last_header_row):
+        last_header_row -= 1
     anchors = {}
     for rng in sheet.merged_cells.ranges:
         anchors[(rng.min_row, rng.min_col, rng.max_row, rng.max_col)] = sheet.cell(rng.min_row, rng.min_col).value
@@ -2396,7 +2831,7 @@ def get_template_columns(template_bytes, selected_state: str | None, form_name: 
         return None
 
     columns = []
-    last_col = min(sheet.max_column, max_cols)
+    last_col = max(min(sheet.max_column, max_cols), _template_table_width(sheet, header_row))
     for c in range(1, last_col + 1):
         parts: list[str] = []
         for r in range(header_row, last_header_row + 1):
@@ -3150,7 +3585,7 @@ with tab1:
                     )
 
 with tab2:
-    st.markdown("### OneDrive Form Archive Browser")
+    st.markdown("### Generated Forms in OneDrive")
     if _graph_config():
         render_onedrive_archive()
     else:
