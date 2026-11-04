@@ -664,6 +664,28 @@ def write_conso_data_sheet(master_path: str, new_df: pd.DataFrame) -> None:
     os.replace(tmp_path, master_path)
 
 
+def normalize_month_year(series: pd.Series) -> pd.Series:
+    """Month-Year must be text like 'April-2026'. Excel turns that text into a date
+    (2026-04-01 00:00:00) when the sheet is pasted or edited, which then shows up as an
+    extra month in the filters. Dates and date-like text go back to 'April-2026'."""
+    def fix(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return v
+        if isinstance(v, (datetime, pd.Timestamp)):
+            return pd.Timestamp(v).strftime("%B-%Y")
+        text = str(v).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}( 00:00:00)?", text):
+            return pd.Timestamp(text[:10]).strftime("%B-%Y")
+        m = re.fullmatch(r"([A-Za-z]+)[\s\-]+(\d{4})", text)
+        if m:
+            try:
+                return datetime.strptime(m.group(1)[:3].title(), "%b").strftime("%B") + "-" + m.group(2)
+            except ValueError:
+                return text
+        return text
+    return series.map(fix)
+
+
 def normalize_unit_key(value: object) -> str:
     return re.sub(r"[\s\-_]+", "", str(value)).strip().lower()
 
@@ -704,6 +726,8 @@ def load_master_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Dat
         file_bytes.seek(0)
 
         df_conso.columns = df_conso.columns.astype(str).str.strip()
+        if "Month-Year" in df_conso.columns:
+            df_conso["Month-Year"] = normalize_month_year(df_conso["Month-Year"])
         df_units.columns = df_units.columns.astype(str).str.strip()
 
         if "Unit" in df_conso.columns:
@@ -3468,6 +3492,8 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         try:
             existing_df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
             existing_df.columns = existing_df.columns.astype(str).str.strip()
+            if "Month-Year" in existing_df.columns:
+                existing_df["Month-Year"] = normalize_month_year(existing_df["Month-Year"])
         except Exception as e:
             st.sidebar.error(f"❌ Failed reading existing master data before append: {e}")
             st.stop()
@@ -3548,6 +3574,44 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
             st.sidebar.warning(f"⚠️ Updated locally, but OneDrive sync issue: {msg_1} | {msg_2}")
 
         st.rerun()
+
+# --- Remove whole months from the master (e.g. old January / March payroll) ---
+with st.sidebar.expander("🗑️ Remove months from master data"):
+    try:
+        _rm_df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
+        _rm_df.columns = _rm_df.columns.astype(str).str.strip()
+        _rm_months = normalize_month_year(_rm_df["Month-Year"]) if "Month-Year" in _rm_df.columns else pd.Series([], dtype=object)
+    except Exception as e:
+        _rm_df, _rm_months = None, pd.Series([], dtype=object)
+        st.error(f"Could not read the master: {e}")
+    if _rm_df is not None:
+        _counts = _rm_months.fillna("(no month)").astype(str).value_counts()
+        _options = sorted(_counts.index.tolist(), key=lambda m: _month_sort_key(m) if m != "(no month)" else (0, 0))
+        st.caption("Rows per month: " + ", ".join(f"{m}: {_counts[m]}" for m in _options))
+        _to_remove = st.multiselect("Months to delete", _options, key="months_to_remove")
+        _confirm = st.checkbox("Yes, permanently delete these months' payroll rows", key="confirm_remove_months")
+        if st.button("Delete selected months", disabled=not (_to_remove and _confirm), key="remove_months_btn"):
+            _keep = ~_rm_months.fillna("(no month)").astype(str).isin(_to_remove)
+            if not _keep.any():
+                st.error("That would delete every row. Keep at least one month.")
+            else:
+                _kept_df = _rm_df[_keep].copy()
+                _kept_df["Month-Year"] = _rm_months[_keep]
+                try:
+                    write_conso_data_sheet(MASTER_FILE_PATH, _kept_df)
+                    with open(MASTER_FILE_PATH, "rb") as f:
+                        _ok, _msg = upload_master_to_cloud(f.read())
+                except Exception as e:
+                    st.error(f"❌ Could not update the master: {e}")
+                    st.stop()
+                st.cache_data.clear()
+                st.session_state["months_removed_note"] = (
+                    f"✅ Deleted {int((~_keep).sum())} rows ({', '.join(_to_remove)}). {len(_kept_df)} rows left."
+                    + ("" if _ok else f" ⚠️ OneDrive sync issue: {_msg}")
+                )
+                st.rerun()
+    if st.session_state.get("months_removed_note"):
+        st.success(st.session_state.pop("months_removed_note"))
 
 [df_conso, df_units, df_mapping_rules, df_col_ref, df_emp_master, df_leave_register, df_attendance_register] = load_master_data()
 merged_df = build_merged_view()
