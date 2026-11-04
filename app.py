@@ -20,7 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
-from openpyxl.styles import Font, PatternFill, Border, Alignment
+from openpyxl.styles import Font, PatternFill, Border, Alignment, Side
 from openpyxl.utils import get_column_letter
 
 
@@ -1021,6 +1021,7 @@ FORM_START_ROWS_BY_STATE = {
     ("MAHARASHTRA", "FORM I"): 12,
     ("MAHARASHTRA", "FORM II"): 13,
     ("MAHARASHTRA", "FORM III"): 9,
+    ("MAHARASHTRA", "FORM II DAMAGE OR LOSS"): 9,
     ("MAHARASHTRA", "FORM II WAGES REGISTER"): 12,
     ("MAHARASHTRA", "FORM IV OVERTIME REGISTER"): 10,
     ("MAHARASHTRA", "FORM IV REGISTER OF ADVANCE"): 13,
@@ -1381,23 +1382,43 @@ def _format_time_value(value: dt_time) -> str:
     return value.strftime("%I:%M %p").lstrip("0")
 
 
+def _active_month_number(active_month: str | None, selected_year: int | None) -> tuple[int, int]:
+    active_month_name = active_month if active_month not in {"All", "", None} else "July"
+    year_value = int(selected_year if selected_year is not None else datetime.now().year)
+    try:
+        month_num = datetime.strptime(active_month_name[:3], "%b").month
+    except ValueError:
+        month_num = datetime.now().month
+    return year_value, month_num
+
+
 def _month_day_rule_value(lowered_rule: str, active_month: str | None, selected_year: int | None) -> datetime | None:
-    """First/last day of the selected month as a real date (shown in the template cell's own
-    date format, DD-MMM-YYYY when the cell has none), or None if the rule is not one."""
-    if "month" not in lowered_rule or "previous" in lowered_rule:
+    """First/last day of the selected month (or of the previous month, for rules that say
+    'previous month') as a real date, shown as DD/MM/YYYY; None if the rule is not one."""
+    if "month" not in lowered_rule:
         return None
     is_first = bool(FIRST_DAY_RULE_RE.search(lowered_rule))
     is_last = bool(LAST_DAY_RULE_RE.search(lowered_rule))
     if not (is_first or is_last):
         return None
-    active_month_name = active_month if active_month not in {"All", "", None} else "July"
-    year_value = selected_year if selected_year is not None else datetime.now().year
-    try:
-        month_num = datetime.strptime(active_month_name[:3], "%b").month
-    except ValueError:
-        month_num = datetime.now().month
-    day = 1 if is_first else calendar.monthrange(int(year_value), month_num)[1]
-    return datetime(int(year_value), month_num, day)
+    year_value, month_num = _active_month_number(active_month, selected_year)
+    if "previous" in lowered_rule or "prev " in lowered_rule:
+        month_num -= 1
+        if month_num == 0:
+            month_num, year_value = 12, year_value - 1
+    day = 1 if is_first else calendar.monthrange(year_value, month_num)[1]
+    return datetime(year_value, month_num, day)
+
+
+def _wage_period_text(active_month: str | None, selected_year: int | None) -> str:
+    """'Wage Period' rule -> '01/04/2026 To 30/04/2026'."""
+    year_value, month_num = _active_month_number(active_month, selected_year)
+    last = calendar.monthrange(year_value, month_num)[1]
+    return f"01/{month_num:02d}/{year_value} To {last:02d}/{month_num:02d}/{year_value}"
+
+
+# 'Col_O (If blank: Not Applicable)' -> the ESIC number, or 'Not Applicable' when the employee has none
+IF_BLANK_RULE_RE = re.compile(r"\(?\s*if\s+(?:blank|empty)\s*[:\-]?\s*(.*?)\s*\)?\s*$", re.IGNORECASE)
 
 
 _ONES = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve",
@@ -1470,6 +1491,15 @@ def resolve_col_rule(
         return ""
     rule_text = _fill_outlet_placeholders(rule_text, selected_unit)
 
+    blank_match = IF_BLANK_RULE_RE.search(rule_text)
+    if blank_match and blank_match.start() > 0:
+        fallback = FIXED_TEXT_MARKER_RE.sub("", blank_match.group(1)).strip(" -")
+        value = resolve_col_rule(rule_text[: blank_match.start()], df_col_ref, row_data, idx, active_month,
+                                 selected_year, df_units, selected_unit)
+        if value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() in ("", "-", "nan", "NaN", "0"):
+            return fallback
+        return value
+
     if EMBEDDED_COL_REF_RE.search(rule_text):
         rule_text = _substitute_embedded_col_refs(rule_text, df_col_ref, row_data)
 
@@ -1485,6 +1515,9 @@ def resolve_col_rule(
 
     if lowered_rule == "auto_generated" or lowered_rule.startswith("auto"):
         return idx + 1
+
+    if lowered_rule in ("wage period", "wage month period", "leave allowed period"):
+        return _wage_period_text(active_month, selected_year)
 
     if lowered_rule == "wage month":
         month_value = active_month if active_month not in {"All", "", None} else "July"
@@ -1721,14 +1754,51 @@ def _is_plain_number_format(fmt) -> bool:
     return not re.search(r"[dmyhs]", re.sub(r'"[^"]*"|\[[^\]]*\]', "", fmt).lower())
 
 
+DATE_DISPLAY_FORMAT = "DD/MM/YYYY"  # every date in every form: 01/04/2026
+
+
+def _is_date_only(value) -> bool:
+    return isinstance(value, datetime) and (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0)
+
+
+def _set_number_format(sheet, coordinate: str, fmt: str) -> None:
+    cell = sheet[coordinate]
+    if isinstance(cell, MergedCell):
+        for merged_range in sheet.merged_cells.ranges:
+            if coordinate in merged_range:
+                sheet.cell(merged_range.min_row, merged_range.min_col).number_format = fmt
+                return
+    cell.number_format = fmt
+
+
+# '05-Mar-1996', '2025-04-10', '10/04/2025', '10-04-2025' typed as text in the payroll file
+_TEXT_DATE_FORMATS = ("%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d %H:%M:%S")
+
+
+def _parse_text_date(value):
+    """A data value that is a date written as text becomes a real date (shown DD/MM/YYYY)."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not (6 <= len(text) <= 19) or not re.fullmatch(r"[0-9A-Za-z\-/. :]+", text) or not re.search(r"\d{4}|\d{2}$", text):
+        return value
+    for fmt in _TEXT_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return value
+
+
 def _apply_date_only_format(cell, value) -> None:
-    """A midnight datetime (joining date etc.) shows as DD-MMM-YYYY, not 'yyyy-mm-dd h:mm:ss'.
-    A template's own date-only format (e.g. D/M/YYYY) is kept."""
-    if not isinstance(value, datetime) or (value.hour, value.minute, value.second, value.microsecond) != (0, 0, 0, 0):
+    """A midnight datetime shows as DD/MM/YYYY, not 'yyyy-mm-dd h:mm:ss'. Title-block cells
+    with their own date format (e.g. a month shown as Apr-26) keep it; data cells are always
+    set to DD/MM/YYYY by generate_dynamic_form."""
+    if not _is_date_only(value):
         return
     fmt = str(cell.number_format or "General")
     if fmt in ("General", "@") or "h" in fmt.lower() or _is_plain_number_format(fmt):
-        cell.number_format = "DD-MMM-YYYY"
+        cell.number_format = DATE_DISPLAY_FORMAT
 
 
 TEMPLATE_MARKER_FILLS = {"FFBDD6EE", "FFFFFF00", "FF9CC2E5"}
@@ -1960,6 +2030,10 @@ def _header_write(sheet, coordinate: str, value) -> None:
     """safe_write for title-block values, always in black text (some templates mark the
     month placeholder in red)."""
     safe_write(sheet, coordinate, value)
+    if isinstance(value, datetime) and value.day != 1:
+        # a real date in the title block (period ending 30/04/2026); a 1st-of-month value is
+        # the form's month and keeps the template's own month format (e.g. Apr-26)
+        _set_number_format(sheet, coordinate, DATE_DISPLAY_FORMAT)
     cell = sheet[coordinate]
     if isinstance(cell, MergedCell):
         for rng in sheet.merged_cells.ranges:
@@ -2226,7 +2300,8 @@ def inject_form_dates(sheet, form_name: str, selected_month: str, selected_year:
         marker_idx = current_text.find(marker)
         if marker_idx != -1:
             prefix = current_text[: marker_idx + len(marker)]
-            new_text = f"{prefix} {selected_month}-{year_suffix}"
+            first = _first_of_month(selected_month, selected_year)
+            new_text = f"{prefix} {first:%d/%m/%Y}"
         else:
             new_text = current_text
         safe_write(sheet, "A8", new_text)
@@ -2335,7 +2410,8 @@ def _is_identifier_header(header_value: object) -> bool:
     is_rate = bool(_RATE_HEADER_RE.search(header_raw)) and not _RATE_AMOUNT_HEADER_RE.search(header_raw)
     return bool(tokens & NON_SUMMABLE_HEADER_TOKENS) or "a/c" in header_raw or is_rate
 
-def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int, data_col_count: int) -> int:
+def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int, data_col_count: int,
+                     skip_cols: set[int] | None = None) -> int:
     """Bold SUM row under the data. Returns the totals row, or last_data_row when no column
     has anything to sum (then no 'Total' row is written at all)."""
     totals_row_idx = last_data_row + 1
@@ -2345,7 +2421,7 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
     populated_columns = set()
     for col_idx in range(3, data_col_count + 1):
         header_text = sheet.cell(row=header_row, column=col_idx).value
-        is_identifier_column = _is_identifier_header(header_text)
+        is_identifier_column = _is_identifier_header(header_text) or col_idx in (skip_cols or set())
 
         column_values = [
             sheet.cell(row=r, column=col_idx).value for r in range(start_row, last_data_row + 1)
@@ -2386,6 +2462,143 @@ def write_totals_row(sheet, header_row: int, start_row: int, last_data_row: int,
     return totals_row_idx
 
 
+def _column_header_labels(sheet, header_row: int, start_row: int, data_col_count: int) -> dict[int, str]:
+    """{col: 'Part II › Sl No'}: every header row's text above a column, merged headings included."""
+    anchors = {}
+    for rng in sheet.merged_cells.ranges:
+        if rng.max_row >= header_row and rng.min_row < start_row:
+            anchors[(rng.min_row, rng.min_col, rng.max_row, rng.max_col)] = sheet.cell(rng.min_row, rng.min_col).value
+    labels = {}
+    for c in range(1, data_col_count + 1):
+        parts = []
+        for r in range(header_row, start_row):
+            v = sheet.cell(r, c).value
+            if v is None:
+                for (r1, c1, r2, c2), val in anchors.items():
+                    if r1 <= r <= r2 and c1 <= c <= c2:
+                        v = val
+                        break
+            text = re.sub(r"\s+", " ", str(v)).strip() if v is not None else ""
+            if text and not re.fullmatch(r"\(?-?\d{1,3}(?:\.0)?[A-Za-z]?\)?", text) and text not in parts:
+                parts.append(text)  # the 1, 2, 3 / (10) numbering row is not part of a heading
+        labels[c] = " › ".join(parts)
+    return labels
+
+
+# a column whose own heading is a serial number, a year or a date is never added up
+_SERIAL_LABEL_RE = re.compile(r"(?:^|›\s*)(?:s\.?\s*l\.?|s\.?\s*r\.?|sr|si|serial)\.?\s*no\.?\s*$|(?:^|›\s*)year\s*$", re.IGNORECASE)
+
+
+def _non_summable_columns(sheet, header_row: int, start_row: int, data_col_count: int) -> set[int]:
+    labels = _column_header_labels(sheet, header_row, start_row, data_col_count)
+    return {c for c, label in labels.items() if label and _SERIAL_LABEL_RE.search(label)}
+
+
+THIN_SIDE = Side(style="thin", color="FF000000")
+THIN_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
+
+
+def _table_font(sheet, header_row: int, start_row: int, data_col_count: int) -> tuple[str | None, float | None]:
+    """The font most used in the template's table body cells (first data row), else the header."""
+    from collections import Counter
+    for r in (start_row, header_row):
+        counts = Counter()
+        for c in range(1, data_col_count + 1):
+            f = sheet.cell(r, c).font
+            if f is not None and f.name:
+                counts[(f.name, f.sz)] += 1
+        if counts:
+            return counts.most_common(1)[0][0]
+    return None, None
+
+
+def finish_table_layout(sheet, header_row: int, start_row: int, last_content_row: int, data_col_count: int,
+                        font_name: str | None = None, font_size: float | None = None) -> None:
+    """Thin border on every cell of the data and total rows (all columns of the table), one
+    font name and size for the whole table body, and no empty bordered template rows left
+    hanging under the table."""
+    if font_name is None:
+        font_name, font_size = _table_font(sheet, header_row, start_row, data_col_count)
+    for r in range(start_row, last_content_row + 1):
+        for c in range(1, data_col_count + 1):
+            cell = sheet.cell(r, c)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.border = THIN_BORDER
+            f = cell.font
+            cell.font = Font(name=font_name or f.name, size=font_size or f.sz, bold=f.bold,
+                             italic=f.italic, color=f.color)
+    # merged cells inside the table: border on every covered cell so the outline is complete
+    for rng in sheet.merged_cells.ranges:
+        if rng.min_row >= start_row and rng.max_row <= last_content_row:
+            for r in range(rng.min_row, rng.max_row + 1):
+                for c in range(rng.min_col, min(rng.max_col, data_col_count) + 1):
+                    sheet.cell(r, c).border = THIN_BORDER
+    # empty rows straight after the table that only carry template borders: clear the borders
+    for r in range(last_content_row + 1, last_content_row + 300):
+        if r > sheet.max_row:
+            break
+        cells = [sheet.cell(r, c) for c in range(1, data_col_count + 1)]
+        if any(not isinstance(cell, MergedCell) and cell.value not in (None, "") for cell in cells):
+            break
+        for cell in cells:
+            if not isinstance(cell, MergedCell):
+                cell.border = Border()
+
+
+# page layout wanted per form (Chandigarh Form A prints portrait)
+FORM_PAGE_SETUP = {("CHANDIGARH", "FORM A"): "portrait"}
+
+
+def apply_page_setup(sheet, selected_state: str | None, form_name: str | None) -> None:
+    key = (str(selected_state or "").strip().upper(), str(form_name or "").strip().upper())
+    orientation = FORM_PAGE_SETUP.get(key)
+    if not orientation:
+        return
+    sheet.page_setup.orientation = orientation
+    sheet.page_setup.paperSize = sheet.PAPERSIZE_A4
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    sheet.page_setup.fitToWidth = 1
+    sheet.page_setup.fitToHeight = 0
+
+
+def _split_column_groups(sheet) -> None:
+    """openpyxl keeps <col min=2 max=5> as one entry keyed 'B'; widening 'C' then writes an
+    overlapping entry and Excel/LibreOffice show the wrong widths. Give every column its own."""
+    from openpyxl.worksheet.dimensions import ColumnDimension
+    for key, dim in list(sheet.column_dimensions.items()):
+        lo, hi = dim.min or 0, dim.max or 0
+        if lo and hi and hi > lo:
+            for idx in range(lo + 1, hi + 1):
+                letter = get_column_letter(idx)
+                new = ColumnDimension(sheet, index=letter, width=dim.width, hidden=dim.hidden,
+                                      customWidth=dim.customWidth, bestFit=dim.bestFit, outlineLevel=dim.outlineLevel)
+                new.min = new.max = idx
+                sheet.column_dimensions[letter] = new
+            dim.max = lo
+
+
+def _display_length(cell) -> int:
+    """How many characters a value takes on screen, so a column is never too narrow ('####')."""
+    val = cell.value
+    if val is None:
+        return 0
+    if isinstance(val, datetime):
+        return 10
+    if isinstance(val, dt_time):
+        return 8
+    if isinstance(val, bool):
+        return 5
+    if isinstance(val, (int, float)):
+        fmt = str(cell.number_format or "General")
+        decimals = 2 if ("0.00" in fmt or (isinstance(val, float) and val != int(val))) else 0
+        text = f"{val:,.{decimals}f}" if "," in fmt else f"{val:.{decimals}f}"
+        return len(text)
+    if isinstance(val, str) and val.startswith("="):
+        return 10
+    return max(len(line) for line in str(val).split("\n"))
+
+
 def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_col_count: int) -> None:
     """
     Dynamically adjusts column widths and row heights based ONLY on the data rows.
@@ -2398,10 +2611,16 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
         return
 
     column_widths: dict[int, float] = {}
+    _split_column_groups(sheet)
+    merged_cols = {}
+    for rng in sheet.merged_cells.ranges:
+        if rng.max_row >= start_row and rng.min_row <= last_content_row and rng.max_col > rng.min_col:
+            merged_cols[(rng.min_row, rng.min_col)] = rng
 
     for col_idx in range(1, data_col_count + 1):
         col_letter = get_column_letter(col_idx)
         max_data_len = 0
+        max_fixed_len = 0  # numbers and dates cannot wrap: the column must fit them
 
         # Scan only the DATA rows to determine required width
         for row_idx in range(start_row, last_content_row + 1):
@@ -2432,20 +2651,20 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
                 )
 
             val = cell.value
-            if val is not None and str(val).strip() != "":
-                # Estimate visual width of the data string
-                lines = str(val).split('\n')
-                longest_line = max(len(line) for line in lines)
-                max_data_len = max(max_data_len, longest_line)
+            if val is not None and str(val).strip() != "" and (row_idx, col_idx) not in merged_cols:
+                length = _display_length(cell)
+                max_data_len = max(max_data_len, length)
+                if not isinstance(val, str) or val.startswith("="):
+                    max_fixed_len = max(max_fixed_len, length)
 
         # Gently adjust column width if the data is wide, capping at 35 so it doesn't stretch infinitely
         current_width = sheet.column_dimensions[col_letter].width
         if current_width is None:
             current_width = 8.5  # Excel default
         if max_data_len > 0:
-            required_width = max_data_len + 1.2
+            required_width = max(min(max_data_len + 1.2, 35), max_fixed_len + 2)
             if required_width > current_width:
-                current_width = min(required_width, 35)
+                current_width = required_width
                 sheet.column_dimensions[col_letter].width = current_width
         column_widths[col_idx] = current_width
 
@@ -2460,8 +2679,10 @@ def apply_smart_formatting(sheet, start_row: int, last_content_row: int, data_co
             if val is None or str(val).strip() == "":
                 continue
             width = max(column_widths.get(col_idx, 8.5), 1)
+            if (row_idx, col_idx) in merged_cols or not isinstance(val, str):
+                continue  # numbers and dates sit on one line; merged cells span wider columns
             for line in str(val).split('\n'):
-                lines_needed = max(1, -(-len(line) // int(width)))  # ceiling division
+                lines_needed = max(1, -(-len(line) // max(int(width) - 1, 1)))  # ceiling division
                 max_lines_needed = max(max_lines_needed, lines_needed)
         sheet.row_dimensions[row_idx].height = max(15, max_lines_needed * 15)
 
@@ -2621,6 +2842,7 @@ def generate_dynamic_form(
     form_rule_row = find_form_rule_row(df_mapping_rules, form_name, selected_state)
 
     data_col_count = table_width
+    serial_cols: set[int] = set()
 
     for offset in range(row_count):
         row = filtered_df.iloc[offset].to_dict()
@@ -2646,6 +2868,8 @@ def generate_dynamic_form(
                     elif pd.notna(candidate) and str(candidate).strip():
                         rule_value = str(candidate).strip()
 
+            if rule_value and rule_value.lower().startswith("auto"):
+                serial_cols.add(col_idx)
             if rule_value and IN_WORDS_RULE_RE.search(rule_value):
                 amount = (resolve_formula_rule(IN_WORDS_RULE_RE.sub("", rule_value).replace("convert", "").replace("Convert", "").strip(), df_col_ref, row)
                           if _is_col_prefixed(re.sub(r"(?i)^\s*convert\s*", "", rule_value)) else sheet.cell(row=row_idx, column=col_idx - 1).value)
@@ -2673,8 +2897,12 @@ def generate_dynamic_form(
                     df_units=df_units,
                     selected_unit=selected_unit,
                 )
-            
-            safe_write(sheet, f"{get_column_letter(col_idx)}{row_idx}", cell_value)
+
+            cell_value = _parse_text_date(cell_value)
+            coordinate = f"{get_column_letter(col_idx)}{row_idx}"
+            safe_write(sheet, coordinate, cell_value)
+            if _is_date_only(cell_value):
+                _set_number_format(sheet, coordinate, DATE_DISPLAY_FORMAT)
 
         if form_name in wage_month_columns:
             month_col_letter = wage_month_columns[form_name]
@@ -2687,7 +2915,8 @@ def generate_dynamic_form(
     totals_row_idx = start_row - 1
     if row_count > 0:
         last_data_row = start_row + row_count - 1
-        totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count)
+        totals_row_idx = write_totals_row(sheet, header_row, start_row, last_data_row, data_col_count,
+                                          skip_cols=serial_cols | _non_summable_columns(sheet, header_row, start_row, data_col_count))
 
     # Clear remaining unused template rows inside the blue/yellow boundary (Leaves footers untouched)
     clear_start_row = totals_row_idx + 1
@@ -2705,6 +2934,12 @@ def generate_dynamic_form(
             cell = sheet.cell(row=row_idx, column=col_idx)
             # Remove the yellow/blue highlights
             cell.fill = PatternFill(fill_type=None)
+
+    # VISUAL FIX 4: every table cell gets a border, one font for the whole table body,
+    # and empty bordered template rows left under the table are cleared
+    if row_count > 0:
+        finish_table_layout(sheet, header_row, start_row, last_content_row, data_col_count)
+    apply_page_setup(sheet, selected_state, form_name)
 
     output = BytesIO()
     workbook.save(output)
@@ -2970,6 +3205,119 @@ def save_rule_edits(master_path: str, rule_row: int, edits: dict[int, str]) -> b
 
 
 
+# ---------------------------------------------------------------------------
+# New payroll layout: move Coloums letters and Sheet1 tags with the columns
+# ---------------------------------------------------------------------------
+_REMAP_COL_TAG_RE = re.compile(r"(col[\s_\-]*)([A-Z]{1,2})(?![A-Za-z0-9])", re.IGNORECASE)
+_REMAP_BARE_AFTER_OP_RE = re.compile(r"(?<=[+\-*/(])(\s*)([A-Z]{1,2})(?![A-Za-z0-9])")
+
+
+def remap_rule_letters(text: object, letter_map: dict[str, str]) -> object:
+    """'Col_BU - (Col_BC + Col_BD)' -> 'Col_BW - (Col_BD + Col_BE)' for {old letter: new letter}.
+    Unit Master rules, aliases (AT1, LVO, LWF1) and plain words are left alone."""
+    if not isinstance(text, str) or "unit master" in text.lower():
+        return text
+    spans = [(m.start(2), m.end(2), m.group(2)) for m in _REMAP_COL_TAG_RE.finditer(text) if m.group(2).isupper()]
+    if _is_col_prefixed(text):
+        for m in _REMAP_BARE_AFTER_OP_RE.finditer(text):
+            if not any(a <= m.start(2) < b for a, b, _ in spans):
+                spans.append((m.start(2), m.end(2), m.group(2)))
+    elif re.fullmatch(r"\s*[A-Z]{1,3}\s*", text):
+        return letter_map.get(text.strip(), text)
+    out, pos = [], 0
+    for a, b, letter in sorted(spans):
+        out.append(text[pos:a]); out.append(letter_map.get(letter, letter)); pos = b
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _replace_sheet_data(sheet_xml: str, sheet_data: str, last_ref: str) -> str:
+    sd = re.search(r"<sheetData\s*/>|<sheetData\b[^>]*>.*?</sheetData>", sheet_xml, re.DOTALL)
+    sheet_xml = sheet_xml[: sd.start()] + sheet_data + sheet_xml[sd.end():]
+    sheet_xml = re.sub(r'<dimension ref="[^"]*"\s*/>', f'<dimension ref="A1:{last_ref}"/>', sheet_xml, count=1)
+    for tag in ("mergeCells", "conditionalFormatting", "dataValidations", "hyperlinks"):
+        sheet_xml = re.sub(rf"<{tag}\b.*?</{tag}>", "", sheet_xml, flags=re.DOTALL)
+    return sheet_xml
+
+
+def relayout_tag_letters(master_path: str, old_columns: list[str], new_columns: list[str]) -> tuple[int, dict[str, str]]:
+    """After Conso_Data gets a new column order (columns added in the payroll file), rewrite the
+    Coloums registry letters and every Sheet1 Col tag so each tag still points at the same
+    column NAME. Returns (number of Sheet1 cells changed, {old letter: new letter} that moved)."""
+    new_pos = {name: i for i, name in enumerate(new_columns)}
+    letter_map = {get_column_letter(i + 1): get_column_letter(new_pos[name] + 1)
+                  for i, name in enumerate(old_columns) if name in new_pos}
+    moved = {k: v for k, v in letter_map.items() if k != v}
+    if not moved and len(new_columns) == len(old_columns):
+        return 0, {}
+
+    with open(master_path, "rb") as f:
+        original = f.read()
+    zin = zipfile.ZipFile(io.BytesIO(original))
+
+    # Coloums: rows 1-2 and the letter list follow the new layout; aliases (AT1.., LVO, LWF1..) are kept
+    reg = pd.read_excel(io.BytesIO(original), sheet_name="Coloums", skiprows=4, header=None, engine="openpyxl")
+    old_letters = {get_column_letter(i + 1) for i in range(len(old_columns))}
+    aliases = []
+    for code, name in zip(reg.iloc[:, 0], reg.iloc[:, 1] if reg.shape[1] > 1 else [None] * len(reg)):
+        if pd.isna(code) or str(code).strip() in old_letters:
+            continue
+        aliases.append((str(code).strip(), "" if pd.isna(name) else name))
+
+    def tcell(ref, v):
+        if v is None or v == "":
+            return ""
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return f'<c r="{ref}"><v>{v}</v></c>'
+        return f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(str(v))}</t></is></c>'
+
+    rows = ['<row r="1">' + "".join(tcell(f"{get_column_letter(i)}1", get_column_letter(i)) for i in range(1, len(new_columns) + 1)) + "</row>",
+            '<row r="2">' + "".join(tcell(f"{get_column_letter(i)}2", n) for i, n in enumerate(new_columns, 1)) + "</row>",
+            '<row r="4">' + tcell("A4", "Column") + tcell("B4", "Field_of_Information") + "</row>"]
+    r = 5
+    for i, name in enumerate(new_columns, 1):
+        rows.append(f'<row r="{r}">' + tcell(f"A{r}", get_column_letter(i)) + tcell(f"B{r}", name) + "</row>"); r += 1
+    for code, name in aliases:
+        rows.append(f'<row r="{r}">' + tcell(f"A{r}", code) + tcell(f"B{r}", name) + "</row>"); r += 1
+    col_path = _sheet_xml_path(zin, "Coloums")
+    col_xml = _replace_sheet_data(zin.read(col_path).decode("utf-8"), "<sheetData>" + "".join(rows) + "</sheetData>",
+                                  f"{get_column_letter(max(len(new_columns), 2))}{r - 1}")
+
+    # Sheet1: every rule cell from column C on
+    rules = pd.read_excel(io.BytesIO(original), sheet_name="Sheet1", header=None, engine="openpyxl")
+    s1_path = _sheet_xml_path(zin, "Sheet1")
+    s1_xml = zin.read(s1_path).decode("utf-8")
+    changed = 0
+    for i in range(rules.shape[0]):
+        cells = {}
+        for j in range(2, rules.shape[1]):
+            v = rules.iat[i, j]
+            nv = remap_rule_letters(v, letter_map)
+            if isinstance(v, str) and nv != v:
+                cells[j + 1] = nv
+        if cells:
+            s1_xml = _patch_sheet_xml(s1_xml, i + 1, cells)
+            changed += len(cells)
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename == col_path:
+                data = col_xml.encode("utf-8")
+            elif item.filename == s1_path:
+                data = s1_xml.encode("utf-8")
+            else:
+                data = zin.read(item.filename)
+            zout.writestr(item, data)
+    new_bytes = out.getvalue()
+    load_workbook(io.BytesIO(new_bytes), read_only=True)  # must still open
+    tmp_path = f"{master_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(new_bytes)
+    os.replace(tmp_path, master_path)
+    return changed, moved
+
+
 st.set_page_config(page_title="HR Compliance Engine", layout="wide")
 
 
@@ -3110,10 +3458,13 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         st.sidebar.error(f"❌ Unable to read uploaded file: {e}")
         st.stop()
 
-    missing_cols = set(df_master.columns) - set(new_conso_df.columns)
-    if missing_cols:
-        st.sidebar.error(f"❌ Missing columns: {missing_cols}")
+    _derived_cols = {"Year", "Month-Year", "Unit_Display", "Unit_Clean", "State", "Unit_Raw"}
+    missing_cols = {c for c in set(df_master.columns) - set(new_conso_df.columns) if c not in _derived_cols}
+    if len(missing_cols) > 10:
+        st.sidebar.error(f"❌ This does not look like the monthly conso file. Missing columns: {sorted(missing_cols)}")
     else:
+        if missing_cols:
+            st.sidebar.warning(f"⚠️ Not in this file (kept blank for this month): {', '.join(sorted(missing_cols))}")
         try:
             existing_df = pd.read_excel(MASTER_FILE_PATH, sheet_name="Conso_Data", skiprows=1, engine="openpyxl")
             existing_df.columns = existing_df.columns.astype(str).str.strip()
@@ -3144,12 +3495,29 @@ if uploaded_file and st.sidebar.button("Validate & Replace Master Data", type="p
         legacy_cleared = int(is_legacy.sum()) if clear_legacy_rows else 0
 
         combined_df = pd.concat([existing_minus_month, new_conso_df], ignore_index=True, sort=False)
+        # column order follows the uploaded file (new columns sit where payroll put them),
+        # then columns only older months have, then Year / Month-Year
+        upload_order = [c for c in new_conso_df.columns if c not in ("Year", "Month-Year")]
+        rest = [c for c in existing_df.columns if c not in upload_order and c not in ("Year", "Month-Year")]
+        combined_df = combined_df[upload_order + rest + ["Year", "Month-Year"]]
 
         try:
             write_conso_data_sheet(MASTER_FILE_PATH, combined_df)
         except Exception as e:
             st.sidebar.error(f"❌ Failed updating Conso_Data sheet in master workbook: {e}")
             st.stop()
+
+        if list(existing_df.columns) != list(combined_df.columns):
+            try:
+                tags_moved, letters_moved = relayout_tag_letters(MASTER_FILE_PATH, list(existing_df.columns), list(combined_df.columns))
+                new_cols = [c for c in combined_df.columns if c not in existing_df.columns]
+                if new_cols:
+                    st.sidebar.info(f"🆕 New columns added: {', '.join(new_cols)}")
+                if letters_moved:
+                    st.sidebar.info(f"🔁 Columns moved, so {tags_moved} Sheet1 tags and the Coloums list were updated to the new letters "
+                                    f"(e.g. {', '.join(f'{a}→{b}' for a, b in list(letters_moved.items())[:4])}).")
+            except Exception as e:
+                st.sidebar.error(f"❌ The data was saved, but updating the tag letters failed: {e}")
 
         with open(MASTER_FILE_PATH, "rb") as f:
             updated_master_bytes = f.read()
