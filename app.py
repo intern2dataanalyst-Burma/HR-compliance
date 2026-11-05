@@ -4408,19 +4408,39 @@ with tab4:
         "hand-typing Col_XX tags."
     )
 
-    rule_states = sorted({str(v).strip() for v in df_mapping_rules.iloc[:, 0].dropna() if str(v).strip()}) if not df_mapping_rules.empty else []
+    def _is_rule_row(i: int) -> bool:
+        """A real Sheet1 rule row: column A is a state name and column B a form name
+        (payroll rows pasted into Sheet1 by mistake have numbers there)."""
+        a_val, b_val = df_mapping_rules.iloc[i, 0], df_mapping_rules.iloc[i, 1] if df_mapping_rules.shape[1] > 1 else None
+        if pd.isna(a_val) or pd.isna(b_val):
+            return False
+        a_txt, b_txt = str(a_val).strip(), str(b_val).strip()
+        if not a_txt or not b_txt or a_txt.lower() in ("state/region", "state"):
+            return False
+        return not re.fullmatch(r"[\d.\-/: ]+", a_txt) and not re.fullmatch(r"[\d.]+", b_txt)
+
+    _rule_rows = [i for i in range(df_mapping_rules.shape[0]) if _is_rule_row(i)] if not df_mapping_rules.empty else []
+    _junk_rows = [i for i in range(df_mapping_rules.shape[0])
+                  if not df_mapping_rules.empty and pd.notna(df_mapping_rules.iloc[i, 0])
+                  and re.fullmatch(r"[\d.]+", str(df_mapping_rules.iloc[i, 0]).strip())]
+    if _junk_rows:
+        st.warning(
+            f"⚠️ Sheet1 (the rules sheet) has {len(_junk_rows)} rows that look like payroll data "
+            f"(rows {_junk_rows[0] + 1}–{_junk_rows[-1] + 1}, column A is a number). They are ignored here, but "
+            "Sheet1 should only hold the State / Form rule rows: please remove those rows from Sheet1 in the master."
+        )
+    rule_states = sorted({str(df_mapping_rules.iloc[i, 0]).strip() for i in _rule_rows})
     if not rule_states:
         st.warning("Sheet1 has no state/form rows to edit.")
     else:
         me_col1, me_col2 = st.columns(2)
         with me_col1:
             me_state = st.selectbox("State", rule_states, key="me_state")
-        me_forms = [
+        me_forms = list(dict.fromkeys(
             str(df_mapping_rules.iloc[i, 1]).strip()
-            for i in range(df_mapping_rules.shape[0])
-            if pd.notna(df_mapping_rules.iloc[i, 0]) and str(df_mapping_rules.iloc[i, 0]).strip().upper() == me_state.upper()
-            and pd.notna(df_mapping_rules.iloc[i, 1])
-        ]
+            for i in _rule_rows
+            if str(df_mapping_rules.iloc[i, 0]).strip().upper() == me_state.upper()
+        ))
         with me_col2:
             me_form = st.selectbox("Form", me_forms, key="me_form")
         me_rule_row = find_form_rule_row(df_mapping_rules, me_form, me_state)
