@@ -27,9 +27,8 @@ from openpyxl.utils import get_column_letter
 custom_css = """
 <style>
 /* Global Background & Font */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
 html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
+    font-family: 'Inter', 'Segoe UI', Roboto, Arial, sans-serif;
     background: radial-gradient(circle at top, #ffffff 0, #f3f6fb 45%, #e5edf7 100%) !important;
     color: #1e293b;
 }
@@ -412,6 +411,111 @@ def _graph_children_raw(cfg: dict, token: str, rel_path: str) -> tuple[list[str]
                 })
         url = payload.get("@odata.nextLink")
     return folders, files
+
+
+# ---------------------------------------------------------------------------
+# Statutory form templates: read from OneDrive (no Google links)
+#   <archive_folder>/Templates/<State>/<Form name>.xlsx   e.g. HR_Compliance_Archive/Templates/Delhi/Form-G.xlsx
+#   [graph] templates_folder = "..." overrides the Templates folder. Without Graph, a local
+#   templates/<State>/ folder next to app.py is used.
+# ---------------------------------------------------------------------------
+def graph_templates_root() -> str:
+    cfg = _graph_config() or {}
+    return str(cfg.get("templates_folder") or f"{graph_archive_root()}/Templates").strip("/")
+
+
+def _form_key(name: str) -> str:
+    """'[1][FORM XVII' / 'Form XVII.xlsx' / 'form-xvii' all give 'formxvii'."""
+    text = re.sub(r"\.xls[xm]$", "", str(name).strip(), flags=re.IGNORECASE)
+    text = re.sub(r"^\s*(?:\[\d+\])+", "", text)
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _sheet1_form_names(state: str) -> list[str]:
+    try:
+        rules = load_master_data()[2]
+    except Exception:
+        return []
+    names = []
+    for i in range(rules.shape[0]):
+        if pd.notna(rules.iloc[i, 0]) and str(rules.iloc[i, 0]).strip().upper() == str(state).strip().upper() and pd.notna(rules.iloc[i, 1]):
+            names.append(str(rules.iloc[i, 1]).strip())
+    return names
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _list_template_files(state: str) -> list[tuple[str, str]]:
+    """[(file name, source)] for one state's templates: 'onedrive:<path>' or 'local:<path>'."""
+    found: list[tuple[str, str]] = []
+    cfg = _graph_config()
+    if cfg and state:
+        folder = f"{graph_templates_root()}/{state}"
+        try:
+            _, files = _graph_children_raw(cfg, _graph_token(cfg), folder)
+            found = [(f["name"], f"onedrive:{folder}/{f['name']}") for f in files
+                     if f["name"].lower().endswith((".xlsx", ".xlsm")) and not f["name"].startswith("~$")]
+        except Exception:
+            found = []
+    if not found and state:
+        local = TEMPLATES_DIR / str(state)
+        if local.is_dir():
+            found = [(p.name, f"local:{p}") for p in sorted(local.iterdir())
+                     if p.suffix.lower() in (".xlsx", ".xlsm") and not p.name.startswith("~$")]
+    return found
+
+
+def get_state_templates(state: str | None) -> dict[str, str]:
+    """{form name: template source} for a state. A file is matched to its Sheet1 form name
+    ignoring case, spaces, dashes and '.xlsx', so 'FORM XVII.xlsx' serves '[1][FORM XVII'."""
+    if not state or state == "All":
+        return {}
+    by_key = {_form_key(n): n for n in _sheet1_form_names(state)}
+    forms: dict[str, str] = {}
+    for file_name, source in _list_template_files(state):
+        form = by_key.get(_form_key(file_name), re.sub(r"\.xls[xm]$", "", file_name, flags=re.IGNORECASE))
+        forms.setdefault(form, source)
+    return dict(sorted(forms.items()))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_template_bytes(source: str) -> bytes:
+    if source.startswith("local:"):
+        return Path(source[len("local:"):]).read_bytes()
+    cfg = _graph_config()
+    if not cfg:
+        raise RuntimeError("Microsoft Graph is not configured, so templates cannot be read from OneDrive")
+    rel = source[len("onedrive:"):]
+    resp = requests.get(_graph_path_url(cfg, rel, "/content"), headers={"Authorization": f"Bearer {_graph_token(cfg)}"}, timeout=60)
+    if resp.status_code == 404:
+        raise RuntimeError(f"Template not found in OneDrive: {rel}")
+    resp.raise_for_status()
+    return _require_xlsx(resp.content, f"Template {rel}")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_logo_data_uri() -> str:
+    """Logo from OneDrive <Templates>/logo.png (or a local logo.png next to app.py)."""
+    import base64
+    content = b""
+    local = BASE_DIR / "logo.png"
+    if local.exists():
+        content = local.read_bytes()
+    else:
+        cfg = _graph_config()
+        if cfg:
+            for name in ("logo.png", "logo.jpg", "logo.jpeg"):
+                try:
+                    resp = requests.get(_graph_path_url(cfg, f"{graph_templates_root()}/{name}", "/content"),
+                                        headers={"Authorization": f"Bearer {_graph_token(cfg)}"}, timeout=30)
+                    if resp.ok and resp.content:
+                        content = resp.content
+                        break
+                except Exception:
+                    break
+    if not content:
+        return ""
+    mime = "image/png" if content[:4] == b"\x89PNG" else "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(content).decode()}"
 
 
 def _month_sort_key(month_year: str) -> tuple:
@@ -3342,6 +3446,214 @@ def relayout_tag_letters(master_path: str, old_columns: list[str], new_columns: 
     return changed, moved
 
 
+# ---------------------------------------------------------------------------
+# Notice register (OneDrive Excel file, replaces the old Google Apps Script page)
+#   <archive_folder>/Notices/Notice_Register.xlsx ; attachments in Notices/Attachments/<Notice ID>/
+# ---------------------------------------------------------------------------
+NOTICE_COLUMNS = ["Notice ID", "Date Received", "State", "Outlet", "Authority", "Notice Ref No", "Subject",
+                  "Due Date", "Status", "Closed On", "Remarks", "Attachment", "Logged By", "Last Updated"]
+NOTICE_STATUSES = ["Open", "In Progress", "Closed"]
+NOTICE_LOCAL_PATH = "data/Notice_Register.xlsx"
+
+
+def _notice_register_path() -> str:
+    return f"{graph_archive_root()}/Notices/Notice_Register.xlsx"
+
+
+def load_notice_register() -> pd.DataFrame:
+    content = b""
+    cfg = _graph_config()
+    if cfg:
+        resp = requests.get(_graph_path_url(cfg, _notice_register_path(), "/content"),
+                            headers={"Authorization": f"Bearer {_graph_token(cfg)}"}, timeout=60)
+        if resp.status_code not in (404,):
+            resp.raise_for_status()
+            content = resp.content
+    elif Path(NOTICE_LOCAL_PATH).exists():
+        content = Path(NOTICE_LOCAL_PATH).read_bytes()
+    if not content:
+        return pd.DataFrame(columns=NOTICE_COLUMNS)
+    df = pd.read_excel(io.BytesIO(_require_xlsx(content, "The notice register")), engine="openpyxl")
+    for col in NOTICE_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    for col in ("Date Received", "Due Date", "Closed On"):
+        df[col] = [v.date() if pd.notna(v) else None for v in pd.to_datetime(df[col], errors="coerce", dayfirst=True)]
+    df = df[NOTICE_COLUMNS + [c for c in df.columns if c not in NOTICE_COLUMNS]].astype(object)
+    return df.where(pd.notna(df), None)
+
+
+def save_notice_register(df: pd.DataFrame) -> tuple[bool, str]:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Notices", index=False)
+        ws = writer.sheets["Notices"]
+        for i, col in enumerate(df.columns, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = 14 if "Date" in col or col in ("Due Date", "Closed On", "Status") else 24
+            if col in ("Date Received", "Due Date", "Closed On"):
+                for r in range(2, len(df) + 2):
+                    ws.cell(r, i).number_format = DATE_DISPLAY_FORMAT
+        ws.freeze_panes = "A2"
+    data = out.getvalue()
+    if _graph_config():
+        return graph_upload_file(_notice_register_path(), data)
+    os.makedirs(os.path.dirname(NOTICE_LOCAL_PATH), exist_ok=True)
+    Path(NOTICE_LOCAL_PATH).write_bytes(data)
+    return True, NOTICE_LOCAL_PATH
+
+
+def _next_notice_id(df: pd.DataFrame) -> str:
+    nums = [int(m.group(1)) for v in df["Notice ID"].dropna().astype(str) for m in [re.fullmatch(r"N-(\d+)", v.strip())] if m]
+    return f"N-{(max(nums) + 1) if nums else 1:04d}"
+
+
+def render_notice_register(df_units: pd.DataFrame) -> None:
+    st.markdown("### Notice Register")
+    st.caption(f"Notices from labour / shops & establishment authorities, saved in OneDrive `{_notice_register_path()}`.")
+    try:
+        notices = load_notice_register()
+    except Exception as exc:
+        st.error(f"Could not read the notice register: {exc}")
+        return
+    if st.session_state.get("notice_saved_note"):
+        st.success(st.session_state.pop("notice_saved_note"))
+
+    state_col = next((c for c in ["State", "STATE", "State/Region", "Region"] if c in df_units.columns), None)
+    units = df_units[["Unit"] + ([state_col] if state_col else [])].dropna(subset=["Unit"]).drop_duplicates()
+    states = sorted({str(v).strip() for v in units[state_col].dropna()}) if state_col else []
+
+    today = datetime.now().date()
+    open_mask = notices["Status"].astype(str).ne("Closed")
+    due = pd.to_datetime(notices["Due Date"], errors="coerce")
+    overdue = open_mask & due.notna() & (due < pd.Timestamp(today))
+    closed = pd.to_datetime(notices["Closed On"], errors="coerce")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Open notices", int(open_mask.sum()))
+    k2.metric("Overdue", int(overdue.sum()))
+    k3.metric("Closed this month", int(((closed.dt.month == today.month) & (closed.dt.year == today.year)).sum()))
+    k4.metric("Total logged", len(notices))
+
+    with st.expander("➕ Log a new notice", expanded=notices.empty):
+        c1, c2 = st.columns(2)
+        with c1:
+            n_state = st.selectbox("State", states or ["-"], key="nt_state")
+            outlets = sorted(units.loc[units[state_col].astype(str).str.strip() == n_state, "Unit"].astype(str).unique()) if state_col else sorted(units["Unit"].astype(str).unique())
+            n_outlet = st.selectbox("Outlet", outlets or ["-"], key="nt_outlet")
+            n_received = st.date_input("Date received", value=today, format="DD/MM/YYYY", key="nt_received")
+            n_due = st.date_input("Reply / compliance due by", value=None, format="DD/MM/YYYY", key="nt_due")
+        with c2:
+            n_authority = st.text_input("Issuing authority (e.g. Labour Inspector, Circle 16)", key="nt_authority")
+            n_ref = st.text_input("Notice reference no.", key="nt_ref")
+            n_subject = st.text_area("Subject / what the notice asks for", key="nt_subject", height=90)
+            n_by = st.text_input("Logged by", key="nt_by")
+        n_file = st.file_uploader("Attach the notice (PDF / image, optional)", type=["pdf", "png", "jpg", "jpeg", "xlsx", "docx"], key="nt_file")
+        if st.button("Save notice", type="primary", key="nt_save"):
+            if not n_subject.strip() and not n_ref.strip():
+                st.error("Enter at least the notice reference or the subject.")
+            else:
+                fresh = load_notice_register()
+                notice_id = _next_notice_id(fresh)
+                link = ""
+                if n_file is not None and _graph_config():
+                    ok, link = graph_upload_file(f"{graph_archive_root()}/Notices/Attachments/{notice_id}/{n_file.name}", n_file.getvalue())
+                    if not ok:
+                        st.warning(f"The notice is saved, but the attachment upload failed: {link}")
+                        link = ""
+                row = {"Notice ID": notice_id, "Date Received": n_received, "State": n_state, "Outlet": n_outlet,
+                       "Authority": n_authority.strip(), "Notice Ref No": n_ref.strip(), "Subject": n_subject.strip(),
+                       "Due Date": n_due, "Status": "Open", "Closed On": None, "Remarks": "", "Attachment": link,
+                       "Logged By": n_by.strip(), "Last Updated": datetime.now().strftime("%d/%m/%Y %H:%M")}
+                ok, msg = save_notice_register(pd.concat([fresh, pd.DataFrame([row])], ignore_index=True))
+                if ok:
+                    st.session_state["notice_saved_note"] = f"✅ Notice {notice_id} saved."
+                    st.rerun()
+                st.error(f"❌ Could not save the notice register: {msg}")
+
+    if notices.empty:
+        st.info("No notices logged yet.")
+        return
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        flt_state = st.selectbox("Filter: State", ["All"] + sorted(notices["State"].dropna().astype(str).unique()), key="nt_f_state")
+    view = notices if flt_state == "All" else notices[notices["State"].astype(str) == flt_state]
+    with f2:
+        flt_outlet = st.selectbox("Filter: Outlet", ["All"] + sorted(view["Outlet"].dropna().astype(str).unique()), key="nt_f_outlet")
+    if flt_outlet != "All":
+        view = view[view["Outlet"].astype(str) == flt_outlet]
+    with f3:
+        flt_status = st.selectbox("Filter: Status", ["Not closed", "All"] + NOTICE_STATUSES, key="nt_f_status")
+    if flt_status == "Not closed":
+        view = view[view["Status"].astype(str) != "Closed"]
+    elif flt_status != "All":
+        view = view[view["Status"].astype(str) == flt_status]
+    view = view.copy()
+    view_due = pd.to_datetime(view["Due Date"], errors="coerce")
+    view.insert(1, "Overdue", (view["Status"].astype(str) != "Closed") & view_due.notna() & (view_due < pd.Timestamp(today)))
+    st.dataframe(
+        view, hide_index=True, use_container_width=True,
+        column_config={
+            "Date Received": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Due Date": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Closed On": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Attachment": st.column_config.LinkColumn(display_text="Open"),
+            "Overdue": st.column_config.CheckboxColumn(),
+        },
+    )
+
+    with st.expander("✏️ Update a notice"):
+        ids = notices["Notice ID"].dropna().astype(str).tolist()
+        pick = st.selectbox("Notice", ids, format_func=lambda i: f"{i} · " + " | ".join(
+            str(v) for v in notices.loc[notices["Notice ID"].astype(str) == i, ["Outlet", "Notice Ref No", "Status"]].iloc[0].tolist()),
+            key="nt_pick")
+        cur = notices[notices["Notice ID"].astype(str) == pick].iloc[0]
+        u1, u2 = st.columns(2)
+        with u1:
+            u_status = st.selectbox("Status", NOTICE_STATUSES, index=NOTICE_STATUSES.index(cur["Status"]) if cur["Status"] in NOTICE_STATUSES else 0, key=f"nt_u_status_{pick}")
+            u_closed = st.date_input("Closed on", value=cur["Closed On"] if pd.notna(cur["Closed On"]) else (today if u_status == "Closed" else None),
+                                     format="DD/MM/YYYY", key=f"nt_u_closed_{pick}")
+        with u2:
+            u_due = st.date_input("Due by", value=cur["Due Date"] if pd.notna(cur["Due Date"]) else None, format="DD/MM/YYYY", key=f"nt_u_due_{pick}")
+            u_remarks = st.text_area("Remarks / action taken", value="" if pd.isna(cur["Remarks"]) else str(cur["Remarks"]), key=f"nt_u_rem_{pick}")
+        u_file = st.file_uploader("Add the reply / closure document (optional)", type=["pdf", "png", "jpg", "jpeg", "xlsx", "docx"], key=f"nt_u_file_{pick}")
+        b1, b2 = st.columns([1, 1])
+        if b1.button("Save changes", type="primary", key=f"nt_u_save_{pick}"):
+            fresh = load_notice_register()
+            idx = fresh.index[fresh["Notice ID"].astype(str) == pick]
+            if len(idx) == 0:
+                st.error("That notice is no longer in the register (someone may have removed it).")
+            else:
+                i = idx[0]
+                fresh.at[i, "Status"] = u_status
+                fresh.at[i, "Closed On"] = (u_closed or today) if u_status == "Closed" else None
+                fresh.at[i, "Due Date"] = u_due
+                fresh.at[i, "Remarks"] = u_remarks.strip()
+                fresh.at[i, "Last Updated"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                if u_file is not None and _graph_config():
+                    ok, link = graph_upload_file(f"{graph_archive_root()}/Notices/Attachments/{pick}/{u_file.name}", u_file.getvalue())
+                    if ok:
+                        fresh.at[i, "Attachment"] = link
+                    else:
+                        st.warning(f"Attachment upload failed: {link}")
+                ok, msg = save_notice_register(fresh)
+                if ok:
+                    st.session_state["notice_saved_note"] = f"✅ Notice {pick} updated ({u_status})."
+                    st.rerun()
+                st.error(f"❌ Could not save the notice register: {msg}")
+        if b2.button("Delete this notice", key=f"nt_u_del_{pick}"):
+            st.session_state[f"nt_confirm_del_{pick}"] = True
+        if st.session_state.get(f"nt_confirm_del_{pick}"):
+            st.warning(f"Delete notice {pick} from the register? This cannot be undone from the app.")
+            if st.button("Yes, delete it", key=f"nt_u_del_yes_{pick}"):
+                fresh = load_notice_register()
+                ok, msg = save_notice_register(fresh[fresh["Notice ID"].astype(str) != pick])
+                st.session_state.pop(f"nt_confirm_del_{pick}", None)
+                if ok:
+                    st.session_state["notice_saved_note"] = f"🗑️ Notice {pick} deleted."
+                    st.rerun()
+                st.error(f"❌ Could not save the notice register: {msg}")
+
+
 st.set_page_config(page_title="HR Compliance Engine", layout="wide")
 
 
@@ -3374,10 +3686,12 @@ if "forms_generated" not in st.session_state:
 if "generated_forms" not in st.session_state:
     st.session_state.generated_forms = {}
 
+_logo_uri = load_logo_data_uri()
+_logo_html = (f'<img src="{_logo_uri}" style="max-height: 120px; width: auto; object-fit: contain; margin-bottom: 12px; '
+              'filter: drop-shadow(0 4px 6px rgba(0,0,0,0.1));">' if _logo_uri else "")
 header_html = """
 <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; margin-bottom: 1.5rem;">
-    <img src="https://drive.google.com/thumbnail?id=1OpUw3MCFGLRs7GQ4xezk5ouqYTvy6yv9&sz=w1000"
-         style="max-height: 120px; width: auto; object-fit: contain; margin-bottom: 12px; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.1));">
+    """ + _logo_html + """
     <h1 style="color: #1d4ed8; font-family: 'Inter', sans-serif; font-weight: 800; font-size: 2.1rem; margin: 0; padding: 0; text-align: center;">
         HR Statutory Compliance Engine
     </h1>
@@ -3675,10 +3989,10 @@ def compile_statutory_forms(
 ) -> tuple[dict[str, bytes], list[str], Path | None]:
     generated: dict[str, bytes] = {}
     errors: list[str] = []
-    state_urls = st.secrets.get("templates", {}).get(selected_state, {})
+    state_urls = get_state_templates(selected_state)
     archive_target_dir: Path | None = None
     if not state_urls:
-        errors.append(f"No template URLs configured for {selected_state}")
+        errors.append(f"No templates found in OneDrive {graph_templates_root()}/{selected_state}")
         return generated, errors, archive_target_dir
 
     active_month = (selected_month.split("-")[0] if selected_month not in {"All", "", None} else "July")
@@ -3688,9 +4002,7 @@ def compile_statutory_forms(
             errors.append(form_name)
             continue
         try:
-            response = requests.get(state_urls[form_name], timeout=15)
-            response.raise_for_status()
-            template_bytes = io.BytesIO(response.content)
+            template_bytes = io.BytesIO(load_template_bytes(state_urls[form_name]))
             form_bytes = generate_dynamic_form(
                 filtered_df,
                 template_bytes,
@@ -3809,12 +4121,13 @@ with tab1:
     if selected_state == "All" or selected_unit == "All":
         st.warning("⚠️ Please select a specific State and Outlet/Brand Unit to enable form generation.")
     else:
-        state_urls = st.secrets.get("templates", {}).get(selected_state, {})
+        state_urls = get_state_templates(selected_state)
+        available_forms = sorted(state_urls.keys())
         if state_urls:
-            available_forms = sorted(state_urls.keys())
             st.info(f"Available statutory form templates for {selected_state}: {', '.join(available_forms)}")
         else:
-            st.warning(f"No statutory form templates configured for {selected_state}.")
+            st.warning(f"No statutory form templates found for {selected_state}. Put them in OneDrive "
+                       f"`{graph_templates_root()}/{selected_state}/` (one .xlsx per form, named like the form).")
 
         gen_col1, gen_col2, debug_col = st.columns(3)
         with gen_col1:
@@ -3880,7 +4193,7 @@ with tab1:
                     st.stop()
                 with st.status("⚡ Generating forms and pushing to cloud OneDrive...", expanded=True) as status:
                     status.write("📄 Compiling statutory form templates...")
-                    state_urls = st.secrets.get("templates", {}).get(selected_state, {})
+                    state_urls = get_state_templates(selected_state)
                     all_forms = list(state_urls.keys())
                     generated, errors, archive_dir = compile_statutory_forms(
                         all_forms,
@@ -3957,18 +4270,16 @@ with tab1:
                     st.error("❌ Select a specific Month-Year to run the diagnostic test.")
                     st.stop()
 
-                state_urls = st.secrets.get("templates", {}).get(selected_state, {})
+                state_urls = get_state_templates(selected_state)
                 if not state_urls:
-                    st.error("No template URLs configured for the selected state.")
+                    st.error(f"No templates found in OneDrive {graph_templates_root()}/{selected_state}.")
                     st.stop()
 
                 diagnostic_frames: dict[str, pd.DataFrame] = {}
 
                 for form_name, template_url in state_urls.items():
                     try:
-                        response = requests.get(template_url, timeout=15)
-                        response.raise_for_status()
-                        template_bytes = io.BytesIO(response.content)
+                        template_bytes = io.BytesIO(load_template_bytes(template_url))
                     except Exception as exc:
                         st.warning(f"⚠️ Could not download template for {form_name}: {exc}")
                         continue
@@ -4086,14 +4397,7 @@ with tab2:
                                 )
 
 with tab3:
-    st.markdown("###  Notice Closure Portal")
-    st.caption("Securely log compliance notices and view the live dashboard below.")
-    
-    # Live Google Workspace URL embedded securely into Streamlit
-    GAS_WEB_APP_URL = "https://script.google.com/a/macros/burmaburma.in/s/AKfycbyiDwUqhB5WgqcAhot3NBnWUiPIJ-0wuKwqhtEF6szXSZVBcr8C6GKu_Yi4XDmyvw8_EQ/exec"
-    
-    # Embed the HTML web app seamlessly into Streamlit with scrolling enabled for the data table
-    components.iframe(GAS_WEB_APP_URL, height=900, scrolling=True)
+    render_notice_register(df_units)
 
 
 with tab4:
@@ -4130,12 +4434,10 @@ with tab4:
         if me_upload is not None:
             me_template = io.BytesIO(me_upload.getvalue())
         else:
-            me_url = st.secrets.get("templates", {}).get(me_state, {}).get(me_form)
+            me_url = get_state_templates(me_state).get(me_form)
             if me_url:
                 try:
-                    resp = requests.get(me_url, timeout=15)
-                    resp.raise_for_status()
-                    me_template = io.BytesIO(resp.content)
+                    me_template = io.BytesIO(load_template_bytes(me_url))
                 except Exception as exc:
                     st.info(f"Could not fetch the configured template ({exc}). Upload one above to see its headers.")
 
